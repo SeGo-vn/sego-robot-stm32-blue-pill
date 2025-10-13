@@ -22,9 +22,12 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 //THEANH
+#include "motor_control.h"
+#include <ctype.h>
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
 //THEANH END
 /* USER CODE END Includes */
 
@@ -83,6 +86,18 @@ typedef struct {
 RobotOdometry robot = {0};
 uint32_t last_odometry_time = 0;
 char uart_buffer[200];
+uint8_t uart_rx_byte = 0;
+volatile uint8_t uart_command_ready = 0;
+size_t uart_command_length = 0;
+char command_buffer[64];
+
+typedef struct {
+    uint8_t active;
+    MotorDirection direction;
+    uint32_t end_time;
+} MotorTimer;
+
+MotorTimer motor_timers[3] = {0};
 //THEANH END
 /* USER CODE END PV */
 
@@ -98,6 +113,8 @@ static void MX_USART1_UART_Init(void);
 void Read_Encoders(void);
 void Calculate_Odometry(float dt);
 void Send_Odometry_Data(void);
+void Process_Command(const char *command);
+void MotorTimers_Update(void);
 //THEANH END
 /* USER CODE END PFP */
 
@@ -164,6 +181,219 @@ void Send_Odometry_Data(void)
 
     HAL_UART_Transmit(&huart1, (uint8_t*)uart_buffer, strlen(uart_buffer), 100);
 }
+
+static MotorDirection Direction_FromToken(const char *token, uint8_t *valid)
+{
+    if (valid) {
+        *valid = 0;
+    }
+    if (token == NULL || token[0] == '\0') {
+        return MOTOR_DIRECTION_STOP;
+    }
+    char c = (char)toupper((unsigned char)token[0]);
+    MotorDirection direction = MOTOR_DIRECTION_STOP;
+    switch (c) {
+    case 'F':
+        direction = MOTOR_DIRECTION_FORWARD;
+        break;
+    case 'R':
+        direction = MOTOR_DIRECTION_REVERSE;
+        break;
+    case 'S':
+        direction = MOTOR_DIRECTION_STOP;
+        break;
+    default:
+        return MOTOR_DIRECTION_STOP;
+    }
+    if (valid) {
+        *valid = 1;
+    }
+    return direction;
+}
+
+static uint8_t ParseDurationMs(const char *token, uint32_t *duration_ms)
+{
+    if (token == NULL || duration_ms == NULL) {
+        return 0;
+    }
+    char *endptr = NULL;
+    unsigned long value = strtoul(token, &endptr, 10);
+    if (endptr == token || (*endptr != '\0' && *endptr != '\r' && *endptr != '\n')) {
+        return 0;
+    }
+    *duration_ms = (uint32_t)value;
+    return 1;
+}
+
+static void MotorTimers_ClearAll(void)
+{
+    for (size_t i = 0; i < 3; ++i) {
+        motor_timers[i].active = 0;
+        motor_timers[i].direction = MOTOR_DIRECTION_STOP;
+        motor_timers[i].end_time = 0;
+    }
+}
+
+static void MotorTimer_Set(uint8_t motor_index, MotorDirection direction, uint32_t duration_ms)
+{
+    if (motor_index >= 3) {
+        return;
+    }
+    if (direction == MOTOR_DIRECTION_STOP || duration_ms == 0) {
+        motor_timers[motor_index].active = 0;
+    } else {
+        motor_timers[motor_index].active = 1;
+        motor_timers[motor_index].direction = direction;
+        motor_timers[motor_index].end_time = HAL_GetTick() + duration_ms;
+    }
+    MotorControl_Set(motor_index + 1, direction);
+}
+
+static void Send_Response(const char *message)
+{
+    if (message == NULL) {
+        return;
+    }
+    HAL_UART_Transmit(&huart1, (uint8_t*)message, strlen(message), 100);
+}
+
+void Process_Command(const char *command)
+{
+    if (command == NULL) {
+        return;
+    }
+
+    char working_copy[64];
+    strncpy(working_copy, command, sizeof(working_copy));
+    working_copy[sizeof(working_copy) - 1] = '\0';
+
+    char *token = strtok(working_copy, " ,");
+    if (token == NULL) {
+        return;
+    }
+
+    if (strcmp(token, "SET") == 0) {
+        char *dir_tokens[3];
+        for (int i = 0; i < 3; ++i) {
+            dir_tokens[i] = strtok(NULL, " ,");
+            if (dir_tokens[i] == NULL) {
+                Send_Response("ERR SET params\r\n");
+                return;
+            }
+        }
+        uint8_t valid = 0;
+        MotorDirection directions[3];
+        for (int i = 0; i < 3; ++i) {
+            directions[i] = Direction_FromToken(dir_tokens[i], &valid);
+            if (!valid) {
+                Send_Response("ERR SET dir\r\n");
+                return;
+            }
+        }
+        MotorTimers_ClearAll();
+        MotorControl_SetAll(directions[0], directions[1], directions[2]);
+        Send_Response("OK SET\r\n");
+        return;
+    }
+
+    if (strcmp(token, "RUN") == 0) {
+        char *param1 = strtok(NULL, " ,");
+        char *param2 = strtok(NULL, " ,");
+        char *param3 = strtok(NULL, " ,");
+        char *param4 = strtok(NULL, " ,");
+        if (param1 == NULL || param2 == NULL) {
+            Send_Response("ERR RUN params\r\n");
+            return;
+        }
+        MotorDirection directions[3];
+        uint32_t duration_ms = 0;
+        uint8_t valid = 0;
+        if (param3 == NULL) {
+            directions[0] = Direction_FromToken(param1, &valid);
+            if (!valid || !ParseDurationMs(param2, &duration_ms)) {
+                Send_Response("ERR RUN data\r\n");
+                return;
+            }
+            directions[1] = directions[0];
+            directions[2] = directions[0];
+        } else if (param4 != NULL && strtok(NULL, " ,") == NULL) {
+            directions[0] = Direction_FromToken(param1, &valid);
+            if (!valid) {
+                Send_Response("ERR RUN dir1\r\n");
+                return;
+            }
+            directions[1] = Direction_FromToken(param2, &valid);
+            if (!valid) {
+                Send_Response("ERR RUN dir2\r\n");
+                return;
+            }
+            directions[2] = Direction_FromToken(param3, &valid);
+            if (!valid || !ParseDurationMs(param4, &duration_ms)) {
+                Send_Response("ERR RUN data\r\n");
+                return;
+            }
+        } else {
+            Send_Response("ERR RUN format\r\n");
+            return;
+        }
+        MotorTimers_ClearAll();
+        for (uint8_t i = 0; i < 3; ++i) {
+            MotorTimer_Set(i, directions[i], duration_ms);
+        }
+        Send_Response("OK RUN\r\n");
+        return;
+    }
+
+    if (strcmp(token, "RUNM") == 0) {
+        char *motor_idx_token = strtok(NULL, " ,");
+        char *dir_token = strtok(NULL, " ,");
+        char *duration_token = strtok(NULL, " ,");
+        if (motor_idx_token == NULL || dir_token == NULL || duration_token == NULL || strtok(NULL, " ,") != NULL) {
+            Send_Response("ERR RUNM params\r\n");
+            return;
+        }
+        int motor_idx = atoi(motor_idx_token);
+        if (motor_idx < 1 || motor_idx > 3) {
+            Send_Response("ERR RUNM motor\r\n");
+            return;
+        }
+        uint8_t valid = 0;
+        MotorDirection direction = Direction_FromToken(dir_token, &valid);
+        uint32_t duration_ms = 0;
+        if (!valid || !ParseDurationMs(duration_token, &duration_ms)) {
+            Send_Response("ERR RUNM data\r\n");
+            return;
+        }
+        MotorTimer_Set((uint8_t)(motor_idx - 1), direction, duration_ms);
+        Send_Response("OK RUNM\r\n");
+        return;
+    }
+
+    if (strcmp(token, "STOP") == 0) {
+        MotorTimers_ClearAll();
+        MotorControl_SetAll(MOTOR_DIRECTION_STOP,
+                            MOTOR_DIRECTION_STOP,
+                            MOTOR_DIRECTION_STOP);
+        Send_Response("OK STOP\r\n");
+        return;
+    }
+
+    Send_Response("ERR UNKNOWN\r\n");
+}
+
+void MotorTimers_Update(void)
+{
+    uint32_t now = HAL_GetTick();
+    for (uint8_t i = 0; i < 3; ++i) {
+        if (motor_timers[i].active) {
+            int32_t remaining = (int32_t)(motor_timers[i].end_time - now);
+            if (remaining <= 0) {
+                motor_timers[i].active = 0;
+                MotorControl_Set(i + 1, MOTOR_DIRECTION_STOP);
+            }
+        }
+    }
+}
 //THEANH END
 /* USER CODE END 0 */
 
@@ -214,6 +444,10 @@ int main(void)
   sprintf(uart_buffer, "STM32 Omni Robot Odometry Started\r\n");
   HAL_UART_Transmit(&huart1, (uint8_t*)uart_buffer, strlen(uart_buffer), 100);
   last_odometry_time = HAL_GetTick();
+  HAL_UART_Receive_IT(&huart1, &uart_rx_byte, 1);
+  MotorControl_SetAll(MOTOR_DIRECTION_STOP,
+                      MOTOR_DIRECTION_STOP,
+                      MOTOR_DIRECTION_STOP);
   //THEANH END
   /* USER CODE END 2 */
 
@@ -222,6 +456,14 @@ int main(void)
   while (1)
   {
 	  //THEANH
+	  if (uart_command_ready)
+	  {
+		  Process_Command(command_buffer);
+		  uart_command_ready = 0;
+	  }
+
+	  MotorTimers_Update();
+
 	  uint32_t current_time = HAL_GetTick();
 	  if (current_time - last_odometry_time >= ODOMETRY_UPDATE_MS)
 	  {
@@ -492,7 +734,43 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
-
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+{
+  if (huart->Instance == USART1)
+  {
+    if (!uart_command_ready)
+    {
+      if (uart_rx_byte == '\r' || uart_rx_byte == '\n')
+      {
+        if (uart_command_length > 0)
+        {
+          if (uart_command_length >= sizeof(command_buffer))
+          {
+            command_buffer[sizeof(command_buffer) - 1] = '\0';
+          }
+          else
+          {
+            command_buffer[uart_command_length] = '\0';
+          }
+          uart_command_ready = 1;
+        }
+        uart_command_length = 0;
+      }
+      else
+      {
+        if (uart_command_length < sizeof(command_buffer) - 1)
+        {
+          command_buffer[uart_command_length++] = (char)uart_rx_byte;
+        }
+        else
+        {
+          uart_command_length = 0;
+        }
+      }
+    }
+    HAL_UART_Receive_IT(&huart1, &uart_rx_byte, 1);
+  }
+}
 /* USER CODE END 4 */
 
 /**
