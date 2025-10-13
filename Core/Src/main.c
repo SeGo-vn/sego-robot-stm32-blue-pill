@@ -694,7 +694,8 @@ static void MX_USART1_UART_Init(void)
     Error_Handler();
   }
   /* USER CODE BEGIN USART1_Init 2 */
-
+  HAL_NVIC_SetPriority(USART1_IRQn, 1, 0);
+  HAL_NVIC_EnableIRQ(USART1_IRQn);
   /* USER CODE END USART1_Init 2 */
 
 }
@@ -716,13 +717,13 @@ static void MX_GPIO_Init(void)
   __HAL_RCC_GPIOB_CLK_ENABLE();
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOB, W1_A_Pin|W1_B_Pin|W2_A_Pin|W2_B_Pin
-                          |W3_A_Pin|W3_B_Pin, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOB, W1_A_Pin|W1_B_Pin|W2_B_Pin|W3_A_Pin
+                          |W3_B_Pin|W2_A_Pin, GPIO_PIN_RESET);
 
-  /*Configure GPIO pins : W1_A_Pin W1_B_Pin W2_A_Pin W2_B_Pin
-                           W3_A_Pin W3_B_Pin */
-  GPIO_InitStruct.Pin = W1_A_Pin|W1_B_Pin|W2_A_Pin|W2_B_Pin
-                          |W3_A_Pin|W3_B_Pin;
+  /*Configure GPIO pins : W1_A_Pin W1_B_Pin W2_B_Pin W3_A_Pin
+                           W3_B_Pin W2_A_Pin */
+  GPIO_InitStruct.Pin = W1_A_Pin|W1_B_Pin|W2_B_Pin|W3_A_Pin
+                          |W3_B_Pin|W2_A_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
