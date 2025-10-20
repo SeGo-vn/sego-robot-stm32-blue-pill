@@ -115,12 +115,24 @@ void Calculate_Odometry(float dt);
 void Send_Odometry_Data(void);
 void Process_Command(const char *command);
 void MotorTimers_Update(void);
+static int32_t Encoder_ComputeDelta(int32_t current_count, int32_t previous_count);
 //THEANH END
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 //THEANH
+static int32_t Encoder_ComputeDelta(int32_t current_count, int32_t previous_count)
+{
+    int32_t delta = current_count - previous_count;
+    if (delta > 32768) {
+        delta -= 65536;
+    } else if (delta < -32768) {
+        delta += 65536;
+    }
+    return delta;
+}
+
 void Read_Encoders(void)
 {
     // Read current encoder counts
@@ -129,9 +141,9 @@ void Read_Encoders(void)
     motor3.count = (int32_t)__HAL_TIM_GET_COUNTER(&htim4);
 
     // Calculate change in counts
-    motor1.delta_count = motor1.count - motor1.prev_count;
-    motor2.delta_count = motor2.count - motor2.prev_count;
-    motor3.delta_count = motor3.count - motor3.prev_count;
+    motor1.delta_count = Encoder_ComputeDelta(motor1.count, motor1.prev_count);
+    motor2.delta_count = Encoder_ComputeDelta(motor2.count, motor2.prev_count);
+    motor3.delta_count = Encoder_ComputeDelta(motor3.count, motor3.prev_count);
 
     // Update previous counts
     motor1.prev_count = motor1.count;
