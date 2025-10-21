@@ -98,6 +98,19 @@ typedef struct {
 } MotorTimer;
 
 MotorTimer motor_timers[3] = {0};
+
+typedef struct {
+    uint8_t active;
+    float target_x;
+    float target_y; 
+    float target_theta;
+    float tolerance_distance;  // meters
+    float tolerance_angle;     // radians
+    uint32_t timeout_ms;
+    uint32_t start_time;
+} ClosedLoopTarget;
+
+ClosedLoopTarget closed_loop_target = {0};
 //THEANH END
 /* USER CODE END PV */
 
@@ -116,6 +129,8 @@ void Send_Odometry_Data(void);
 void Process_Command(const char *command);
 void MotorTimers_Update(void);
 static int32_t Encoder_ComputeDelta(int32_t current_count, int32_t previous_count);
+uint8_t IsAtTarget(void);
+void UpdateClosedLoopControl(void);
 //THEANH END
 /* USER CODE END PFP */
 
@@ -269,6 +284,107 @@ static void Send_Response(const char *message)
     HAL_UART_Transmit(&huart1, (uint8_t*)message, strlen(message), 100);
 }
 
+//THEANH - Closed Loop Control Functions
+uint8_t IsAtTarget(void) {
+    if (!closed_loop_target.active) return 1;
+    
+    float dx = robot.x - closed_loop_target.target_x;
+    float dy = robot.y - closed_loop_target.target_y;
+    float distance_error = sqrtf(dx*dx + dy*dy);
+    
+    float angle_error = robot.theta - closed_loop_target.target_theta;
+    // Normalize angle error to [-pi, pi]
+    while (angle_error > M_PI) angle_error -= 2.0f * M_PI;
+    while (angle_error < -M_PI) angle_error += 2.0f * M_PI;
+    angle_error = fabsf(angle_error);
+    
+    return (distance_error < closed_loop_target.tolerance_distance && 
+            angle_error < closed_loop_target.tolerance_angle);
+}
+
+void UpdateClosedLoopControl(void) {
+    if (!closed_loop_target.active) return;
+    
+    uint32_t now = HAL_GetTick();
+    
+    // Check timeout
+    if ((now - closed_loop_target.start_time) > closed_loop_target.timeout_ms) {
+        closed_loop_target.active = 0;
+        MotorControl_SetAll(MOTOR_DIRECTION_STOP, MOTOR_DIRECTION_STOP, MOTOR_DIRECTION_STOP);
+        Send_Response("TIMEOUT\r\n");
+        return;
+    }
+    
+    // Check if target reached
+    if (IsAtTarget()) {
+        closed_loop_target.active = 0;
+        MotorControl_SetAll(MOTOR_DIRECTION_STOP, MOTOR_DIRECTION_STOP, MOTOR_DIRECTION_STOP);
+        Send_Response("TARGET_REACHED\r\n");
+        return;
+    }
+    
+    // Simple proportional control
+    float dx = closed_loop_target.target_x - robot.x;
+    float dy = closed_loop_target.target_y - robot.y;
+    float dtheta = closed_loop_target.target_theta - robot.theta;
+    
+    // Normalize angle
+    while (dtheta > M_PI) dtheta -= 2.0f * M_PI;
+    while (dtheta < -M_PI) dtheta += 2.0f * M_PI;
+    
+    // Convert world coordinates to robot coordinates
+    float cos_theta = cosf(robot.theta);
+    float sin_theta = sinf(robot.theta);
+    float dx_robot = dx * cos_theta + dy * sin_theta;
+    float dy_robot = -dx * sin_theta + dy * cos_theta;
+    
+    // Simple bang-bang control (can be improved with PID)
+    MotorDirection d1 = MOTOR_DIRECTION_STOP;
+    MotorDirection d2 = MOTOR_DIRECTION_STOP;
+    MotorDirection d3 = MOTOR_DIRECTION_STOP;
+    
+    float threshold = 0.01; // 1cm threshold
+    
+    if (fabsf(dx_robot) > threshold) {
+        if (dx_robot > 0) {
+            d1 = MOTOR_DIRECTION_FORWARD;
+            d2 = MOTOR_DIRECTION_REVERSE;
+            // d3 stays STOP for pure forward
+        } else {
+            d1 = MOTOR_DIRECTION_REVERSE;
+            d2 = MOTOR_DIRECTION_FORWARD;
+            // d3 stays STOP for pure backward
+        }
+    } else if (fabsf(dy_robot) > threshold) {
+        if (dy_robot > 0) {
+            // Move left
+            d1 = MOTOR_DIRECTION_STOP;
+            d2 = MOTOR_DIRECTION_FORWARD;
+            d3 = MOTOR_DIRECTION_REVERSE;
+        } else {
+            // Move right  
+            d1 = MOTOR_DIRECTION_STOP;
+            d2 = MOTOR_DIRECTION_REVERSE;
+            d3 = MOTOR_DIRECTION_FORWARD;
+        }
+    } else if (fabsf(dtheta) > 0.05) { // ~3 degrees
+        if (dtheta > 0) {
+            // Rotate counterclockwise
+            d1 = MOTOR_DIRECTION_FORWARD;
+            d2 = MOTOR_DIRECTION_FORWARD;
+            d3 = MOTOR_DIRECTION_FORWARD;
+        } else {
+            // Rotate clockwise
+            d1 = MOTOR_DIRECTION_REVERSE;
+            d2 = MOTOR_DIRECTION_REVERSE;
+            d3 = MOTOR_DIRECTION_REVERSE;
+        }
+    }
+    
+    MotorControl_SetAll(d1, d2, d3);
+}
+//THEANH END
+
 void Process_Command(const char *command)
 {
     if (command == NULL) {
@@ -383,12 +499,70 @@ void Process_Command(const char *command)
 
     if (strcmp(token, "STOP") == 0) {
         MotorTimers_ClearAll();
+        closed_loop_target.active = 0; // Stop any active closed-loop control
         MotorControl_SetAll(MOTOR_DIRECTION_STOP,
                             MOTOR_DIRECTION_STOP,
                             MOTOR_DIRECTION_STOP);
         Send_Response("OK STOP\r\n");
         return;
     }
+
+    //THEANH - New Closed Loop Commands
+    if (strcmp(token, "MOVE_DIST") == 0) {
+        char *distance_token = strtok(NULL, " ,");
+        if (distance_token == NULL || strtok(NULL, " ,") != NULL) {
+            Send_Response("ERR MOVE_DIST params\r\n");
+            return;
+        }
+        
+        float distance = atof(distance_token);
+        
+        // Set target relative to current position (forward direction)
+        float cos_theta = cosf(robot.theta);
+        float sin_theta = sinf(robot.theta);
+        
+        closed_loop_target.active = 1;
+        closed_loop_target.target_x = robot.x + distance * cos_theta;
+        closed_loop_target.target_y = robot.y + distance * sin_theta;
+        closed_loop_target.target_theta = robot.theta;
+        closed_loop_target.tolerance_distance = 0.01; // 1cm tolerance
+        closed_loop_target.tolerance_angle = 0.05;    // ~3 degree tolerance
+        closed_loop_target.timeout_ms = 10000;        // 10 second timeout
+        closed_loop_target.start_time = HAL_GetTick();
+        
+        Send_Response("OK MOVE_DIST\r\n");
+        return;
+    }
+    
+    if (strcmp(token, "ROTATE_DEG") == 0) {
+        char *angle_token = strtok(NULL, " ,");
+        if (angle_token == NULL || strtok(NULL, " ,") != NULL) {
+            Send_Response("ERR ROTATE_DEG params\r\n");
+            return;
+        }
+        
+        float angle_deg = atof(angle_token);
+        float angle_rad = angle_deg * M_PI / 180.0f;
+        
+        closed_loop_target.active = 1;
+        closed_loop_target.target_x = robot.x;  // Don't move position
+        closed_loop_target.target_y = robot.y;
+        closed_loop_target.target_theta = robot.theta + angle_rad;
+        // Normalize target angle
+        while (closed_loop_target.target_theta > M_PI) 
+            closed_loop_target.target_theta -= 2.0f * M_PI;
+        while (closed_loop_target.target_theta < -M_PI) 
+            closed_loop_target.target_theta += 2.0f * M_PI;
+            
+        closed_loop_target.tolerance_distance = 0.02; // 2cm tolerance (allow some drift)
+        closed_loop_target.tolerance_angle = 0.02;    // ~1 degree tolerance
+        closed_loop_target.timeout_ms = 10000;
+        closed_loop_target.start_time = HAL_GetTick();
+        
+        Send_Response("OK ROTATE_DEG\r\n");
+        return;
+    }
+    //THEANH END
 
     Send_Response("ERR UNKNOWN\r\n");
 }
@@ -475,6 +649,7 @@ int main(void)
 	  }
 
 	  MotorTimers_Update();
+	  UpdateClosedLoopControl(); // New closed-loop control update
 
 	  uint32_t current_time = HAL_GetTick();
 	  if (current_time - last_odometry_time >= ODOMETRY_UPDATE_MS)
