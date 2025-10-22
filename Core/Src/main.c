@@ -45,7 +45,9 @@
 #define WHEEL_DIAMETER_M        0.058   // 58mm wheel diameter
 #define WHEEL_CIRCUMFERENCE_M   (M_PI * WHEEL_DIAMETER_M)  // 0.182 meters
 #define ROBOT_RADIUS_M          0.105   // 10.5cm from center to wheel
-#define METERS_PER_COUNT        (WHEEL_CIRCUMFERENCE_M / COUNTS_PER_WHEEL_REV)
+// Empirical scale so encoder odometry matches 10/20cm tape tests (actual ≈ 77-86% of requested travel)
+#define ODOM_DISTANCE_SCALE     0.83f
+#define METERS_PER_COUNT        ((WHEEL_CIRCUMFERENCE_M / COUNTS_PER_WHEEL_REV) * ODOM_DISTANCE_SCALE)
 #define ODOMETRY_UPDATE_HZ      50      // Calculate odometry 50 times per second
 #define ODOMETRY_UPDATE_MS      (1000 / ODOMETRY_UPDATE_HZ)
 #define UART_BAUD_RATE          115200  // Baud rate for Raspberry Pi communication
