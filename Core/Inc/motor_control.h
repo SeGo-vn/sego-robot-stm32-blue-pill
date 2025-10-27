@@ -13,8 +13,10 @@ typedef enum {
     MOTOR_DIRECTION_REVERSE
 } MotorDirection;
 
+void MotorControl_InitPwm(void);
 void MotorControl_Set(uint8_t motor_index, MotorDirection direction);
 void MotorControl_SetAll(MotorDirection motor1, MotorDirection motor2, MotorDirection motor3);
+void MotorControl_Command(uint8_t motor_index, float speed);
 
 #ifdef __cplusplus
 }

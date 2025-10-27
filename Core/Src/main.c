@@ -46,7 +46,7 @@
 #define WHEEL_CIRCUMFERENCE_M   (M_PI * WHEEL_DIAMETER_M)  // 0.182 meters
 #define ROBOT_RADIUS_M          0.105   // 10.5cm from center to wheel
 // Empirical scale so encoder odometry matches 10/20cm tape tests (actual ≈ 77-86% of requested travel)
-#define ODOM_DISTANCE_SCALE     0.83f
+#define ODOM_DISTANCE_SCALE     0.872947f  // Calibrated from 0.187 m / 0.1778 m
 #define METERS_PER_COUNT        ((WHEEL_CIRCUMFERENCE_M / COUNTS_PER_WHEEL_REV) * ODOM_DISTANCE_SCALE)
 #define ODOMETRY_UPDATE_HZ      50      // Calculate odometry 50 times per second
 #define ODOMETRY_UPDATE_MS      (1000 / ODOMETRY_UPDATE_HZ)
@@ -60,11 +60,12 @@
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
+TIM_HandleTypeDef htim1;
 TIM_HandleTypeDef htim2;
 TIM_HandleTypeDef htim3;
 TIM_HandleTypeDef htim4;
 
-UART_HandleTypeDef huart1;
+UART_HandleTypeDef huart3;
 
 /* USER CODE BEGIN PV */
 //THEANH
@@ -122,7 +123,8 @@ static void MX_GPIO_Init(void);
 static void MX_TIM2_Init(void);
 static void MX_TIM3_Init(void);
 static void MX_TIM4_Init(void);
-static void MX_USART1_UART_Init(void);
+static void MX_USART3_UART_Init(void);
+static void MX_TIM1_Init(void);
 /* USER CODE BEGIN PFP */
 //THEANH
 void Read_Encoders(void);
@@ -208,7 +210,7 @@ void Send_Odometry_Data(void)
             robot.vx, robot.vy, robot.omega,
             motor1.delta_count, motor2.delta_count, motor3.delta_count);
 
-    HAL_UART_Transmit(&huart1, (uint8_t*)uart_buffer, strlen(uart_buffer), 100);
+    HAL_UART_Transmit(&huart3, (uint8_t*)uart_buffer, strlen(uart_buffer), 100);
 }
 
 static MotorDirection Direction_FromToken(const char *token, uint8_t *valid)
@@ -283,7 +285,7 @@ static void Send_Response(const char *message)
     if (message == NULL) {
         return;
     }
-    HAL_UART_Transmit(&huart1, (uint8_t*)message, strlen(message), 100);
+    HAL_UART_Transmit(&huart3, (uint8_t*)message, strlen(message), 100);
 }
 
 //THEANH - Closed Loop Control Functions
@@ -325,65 +327,71 @@ void UpdateClosedLoopControl(void) {
         return;
     }
     
-    // Simple proportional control
+    // Proportional error
     float dx = closed_loop_target.target_x - robot.x;
     float dy = closed_loop_target.target_y - robot.y;
     float dtheta = closed_loop_target.target_theta - robot.theta;
-    
-    // Normalize angle
     while (dtheta > M_PI) dtheta -= 2.0f * M_PI;
     while (dtheta < -M_PI) dtheta += 2.0f * M_PI;
-    
-    // Convert world coordinates to robot coordinates
+
+    // Convert world error into robot frame
     float cos_theta = cosf(robot.theta);
     float sin_theta = sinf(robot.theta);
     float dx_robot = dx * cos_theta + dy * sin_theta;
     float dy_robot = -dx * sin_theta + dy * cos_theta;
-    
-    // Simple bang-bang control (can be improved with PID)
-    MotorDirection d1 = MOTOR_DIRECTION_STOP;
-    MotorDirection d2 = MOTOR_DIRECTION_STOP;
-    MotorDirection d3 = MOTOR_DIRECTION_STOP;
-    
-    float threshold = 0.01; // 1cm threshold
-    
-    if (fabsf(dx_robot) > threshold) {
-        if (dx_robot > 0) {
-            d1 = MOTOR_DIRECTION_FORWARD;
-            d2 = MOTOR_DIRECTION_REVERSE;
-            // d3 stays STOP for pure forward
-        } else {
-            d1 = MOTOR_DIRECTION_REVERSE;
-            d2 = MOTOR_DIRECTION_FORWARD;
-            // d3 stays STOP for pure backward
-        }
-    } else if (fabsf(dy_robot) > threshold) {
-        if (dy_robot > 0) {
-            // Move left
-            d1 = MOTOR_DIRECTION_STOP;
-            d2 = MOTOR_DIRECTION_FORWARD;
-            d3 = MOTOR_DIRECTION_REVERSE;
-        } else {
-            // Move right  
-            d1 = MOTOR_DIRECTION_STOP;
-            d2 = MOTOR_DIRECTION_REVERSE;
-            d3 = MOTOR_DIRECTION_FORWARD;
-        }
-    } else if (fabsf(dtheta) > 0.05) { // ~3 degrees
-        if (dtheta > 0) {
-            // Rotate counterclockwise
-            d1 = MOTOR_DIRECTION_FORWARD;
-            d2 = MOTOR_DIRECTION_FORWARD;
-            d3 = MOTOR_DIRECTION_FORWARD;
-        } else {
-            // Rotate clockwise
-            d1 = MOTOR_DIRECTION_REVERSE;
-            d2 = MOTOR_DIRECTION_REVERSE;
-            d3 = MOTOR_DIRECTION_REVERSE;
-        }
+
+    // Gain settings (tune experimentally)
+    const float linear_k = 1.0f;   // proportional gain for translation
+    const float angular_k = 0.8f;  // proportional gain for heading
+    const float max_speed = 1.0f;  // clamp speed commands to [-1, 1]
+    const float deadband = 0.01f;  // ignore very small commands
+    const float min_duty_linear = 0.18f;   // minimum duty for translation
+    const float min_duty_rotate = 0.08f;   // minimum duty for pure rotation
+
+    float vx = linear_k * dx_robot;
+    float vy = linear_k * dy_robot;
+    float omega = angular_k * dtheta;
+
+    // Clamp commands
+    vx = fmaxf(fminf(vx, max_speed), -max_speed);
+    vy = fmaxf(fminf(vy, max_speed), -max_speed);
+    omega = fmaxf(fminf(omega, max_speed), -max_speed);
+
+    // Omni wheel inverse kinematics (same formulas as ROS bridge)
+    float w1 = vx + ROBOT_RADIUS_M * omega;
+    float w2 = -0.5f * vx + (sqrtf(3.0f) / 2.0f) * vy + ROBOT_RADIUS_M * omega;
+    float w3 = -0.5f * vx - (sqrtf(3.0f) / 2.0f) * vy + ROBOT_RADIUS_M * omega;
+
+    // Normalize so largest magnitude is 1
+    float max_mag = fmaxf(fmaxf(fabsf(w1), fabsf(w2)), fabsf(w3));
+    if (max_mag > 1.0f) {
+        w1 /= max_mag;
+        w2 /= max_mag;
+        w3 /= max_mag;
     }
-    
-    MotorControl_SetAll(d1, d2, d3);
+
+    int rotating_only = (fabsf(vx) < deadband && fabsf(vy) < deadband && fabsf(omega) >= deadband);
+    float min_duty = rotating_only ? min_duty_rotate : min_duty_linear;
+
+    if (fabsf(w1) < deadband) {
+        w1 = 0.0f;
+    } else if (fabsf(w1) < min_duty) {
+        w1 = copysignf(min_duty, w1);
+    }
+    if (fabsf(w2) < deadband) {
+        w2 = 0.0f;
+    } else if (fabsf(w2) < min_duty) {
+        w2 = copysignf(min_duty, w2);
+    }
+    if (fabsf(w3) < deadband) {
+        w3 = 0.0f;
+    } else if (fabsf(w3) < min_duty) {
+        w3 = copysignf(min_duty, w3);
+    }
+
+    MotorControl_Command(1, w1);
+    MotorControl_Command(2, w2);
+    MotorControl_Command(3, w3);
 }
 //THEANH END
 
@@ -617,9 +625,11 @@ int main(void)
   MX_TIM2_Init();
   MX_TIM3_Init();
   MX_TIM4_Init();
-  MX_USART1_UART_Init();
+  MX_USART3_UART_Init();
+  MX_TIM1_Init();
   /* USER CODE BEGIN 2 */
   //THEANH
+  MotorControl_InitPwm();
   HAL_TIM_Encoder_Start(&htim2, TIM_CHANNEL_ALL);
   HAL_TIM_Encoder_Start(&htim3, TIM_CHANNEL_ALL);
   HAL_TIM_Encoder_Start(&htim4, TIM_CHANNEL_ALL);
@@ -630,9 +640,9 @@ int main(void)
   motor2.prev_count = 32768;
   motor3.prev_count = 32768;
   sprintf(uart_buffer, "STM32 Omni Robot Odometry Started\r\n");
-  HAL_UART_Transmit(&huart1, (uint8_t*)uart_buffer, strlen(uart_buffer), 100);
+  HAL_UART_Transmit(&huart3, (uint8_t*)uart_buffer, strlen(uart_buffer), 100);
   last_odometry_time = HAL_GetTick();
-  HAL_UART_Receive_IT(&huart1, &uart_rx_byte, 1);
+  HAL_UART_Receive_IT(&huart3, &uart_rx_byte, 1);
   MotorControl_SetAll(MOTOR_DIRECTION_STOP,
                       MOTOR_DIRECTION_STOP,
                       MOTOR_DIRECTION_STOP);
@@ -706,6 +716,79 @@ void SystemClock_Config(void)
   {
     Error_Handler();
   }
+}
+
+/**
+  * @brief TIM1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM1_Init(void)
+{
+
+  /* USER CODE BEGIN TIM1_Init 0 */
+
+  /* USER CODE END TIM1_Init 0 */
+
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+  TIM_OC_InitTypeDef sConfigOC = {0};
+  TIM_BreakDeadTimeConfigTypeDef sBreakDeadTimeConfig = {0};
+
+  /* USER CODE BEGIN TIM1_Init 1 */
+
+  /* USER CODE END TIM1_Init 1 */
+  htim1.Instance = TIM1;
+  htim1.Init.Prescaler = 0;
+  htim1.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim1.Init.Period = 399;
+  htim1.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim1.Init.RepetitionCounter = 0;
+  htim1.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_PWM_Init(&htim1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim1, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sConfigOC.OCMode = TIM_OCMODE_PWM1;
+  sConfigOC.Pulse = 0;
+  sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
+  sConfigOC.OCNPolarity = TIM_OCNPOLARITY_HIGH;
+  sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
+  sConfigOC.OCIdleState = TIM_OCIDLESTATE_RESET;
+  sConfigOC.OCNIdleState = TIM_OCNIDLESTATE_RESET;
+  if (HAL_TIM_PWM_ConfigChannel(&htim1, &sConfigOC, TIM_CHANNEL_1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_TIM_PWM_ConfigChannel(&htim1, &sConfigOC, TIM_CHANNEL_2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_TIM_PWM_ConfigChannel(&htim1, &sConfigOC, TIM_CHANNEL_3) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sBreakDeadTimeConfig.OffStateRunMode = TIM_OSSR_DISABLE;
+  sBreakDeadTimeConfig.OffStateIDLEMode = TIM_OSSI_DISABLE;
+  sBreakDeadTimeConfig.LockLevel = TIM_LOCKLEVEL_OFF;
+  sBreakDeadTimeConfig.DeadTime = 0;
+  sBreakDeadTimeConfig.BreakState = TIM_BREAK_DISABLE;
+  sBreakDeadTimeConfig.BreakPolarity = TIM_BREAKPOLARITY_HIGH;
+  sBreakDeadTimeConfig.AutomaticOutput = TIM_AUTOMATICOUTPUT_DISABLE;
+  if (HAL_TIMEx_ConfigBreakDeadTime(&htim1, &sBreakDeadTimeConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM1_Init 2 */
+
+  /* USER CODE END TIM1_Init 2 */
+  HAL_TIM_MspPostInit(&htim1);
+
 }
 
 /**
@@ -856,36 +939,35 @@ static void MX_TIM4_Init(void)
 }
 
 /**
-  * @brief USART1 Initialization Function
+  * @brief USART3 Initialization Function
   * @param None
   * @retval None
   */
-static void MX_USART1_UART_Init(void)
+static void MX_USART3_UART_Init(void)
 {
 
-  /* USER CODE BEGIN USART1_Init 0 */
+  /* USER CODE BEGIN USART3_Init 0 */
 
-  /* USER CODE END USART1_Init 0 */
+  /* USER CODE END USART3_Init 0 */
 
-  /* USER CODE BEGIN USART1_Init 1 */
+  /* USER CODE BEGIN USART3_Init 1 */
 
-  /* USER CODE END USART1_Init 1 */
-  huart1.Instance = USART1;
-  huart1.Init.BaudRate = 115200;
-  huart1.Init.WordLength = UART_WORDLENGTH_8B;
-  huart1.Init.StopBits = UART_STOPBITS_1;
-  huart1.Init.Parity = UART_PARITY_NONE;
-  huart1.Init.Mode = UART_MODE_TX_RX;
-  huart1.Init.HwFlowCtl = UART_HWCONTROL_NONE;
-  huart1.Init.OverSampling = UART_OVERSAMPLING_16;
-  if (HAL_UART_Init(&huart1) != HAL_OK)
+  /* USER CODE END USART3_Init 1 */
+  huart3.Instance = USART3;
+  huart3.Init.BaudRate = 115200;
+  huart3.Init.WordLength = UART_WORDLENGTH_8B;
+  huart3.Init.StopBits = UART_STOPBITS_1;
+  huart3.Init.Parity = UART_PARITY_NONE;
+  huart3.Init.Mode = UART_MODE_TX_RX;
+  huart3.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart3.Init.OverSampling = UART_OVERSAMPLING_16;
+  if (HAL_UART_Init(&huart3) != HAL_OK)
   {
     Error_Handler();
   }
-  /* USER CODE BEGIN USART1_Init 2 */
-  HAL_NVIC_SetPriority(USART1_IRQn, 1, 0);
-  HAL_NVIC_EnableIRQ(USART1_IRQn);
-  /* USER CODE END USART1_Init 2 */
+  /* USER CODE BEGIN USART3_Init 2 */
+
+  /* USER CODE END USART3_Init 2 */
 
 }
 
@@ -906,13 +988,13 @@ static void MX_GPIO_Init(void)
   __HAL_RCC_GPIOB_CLK_ENABLE();
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOB, W1_A_Pin|W1_B_Pin|W2_B_Pin|W3_A_Pin
-                          |W3_B_Pin|W2_A_Pin, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOB, W1_A_Pin|W1_B_Pin|W2_B_Pin|W2_A_Pin
+                          |W3_A_Pin|W3_B_Pin, GPIO_PIN_RESET);
 
-  /*Configure GPIO pins : W1_A_Pin W1_B_Pin W2_B_Pin W3_A_Pin
-                           W3_B_Pin W2_A_Pin */
-  GPIO_InitStruct.Pin = W1_A_Pin|W1_B_Pin|W2_B_Pin|W3_A_Pin
-                          |W3_B_Pin|W2_A_Pin;
+  /*Configure GPIO pins : W1_A_Pin W1_B_Pin W2_B_Pin W2_A_Pin
+                           W3_A_Pin W3_B_Pin */
+  GPIO_InitStruct.Pin = W1_A_Pin|W1_B_Pin|W2_B_Pin|W2_A_Pin
+                          |W3_A_Pin|W3_B_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
@@ -926,7 +1008,7 @@ static void MX_GPIO_Init(void)
 /* USER CODE BEGIN 4 */
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 {
-  if (huart->Instance == USART1)
+  if (huart->Instance == USART3)
   {
     if (!uart_command_ready)
     {
@@ -958,7 +1040,7 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
         }
       }
     }
-    HAL_UART_Receive_IT(&huart1, &uart_rx_byte, 1);
+    HAL_UART_Receive_IT(&huart3, &uart_rx_byte, 1);
   }
 }
 /* USER CODE END 4 */
