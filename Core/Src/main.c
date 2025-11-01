@@ -191,7 +191,7 @@ void Calculate_Odometry(float dt)
     // Average vx from M1 and M3: vx = (v3 - v1) / 2
     robot.vx = (v3 - v1) / 2.0f;  // M3 forward (0°) minus M1 backward (180°)
     robot.vy = v2;  // M2 left (90°)
-    robot.omega = (v1 + v2 + v3) / (3.0f * ROBOT_RADIUS_M);  // rotation from all wheels
+    robot.omega = -(v1 + v2 + v3) / (3.0f * ROBOT_RADIUS_M);  // rotation from all wheels (negated to fix left/right swap)
 
     robot.theta += robot.omega * dt;
 
