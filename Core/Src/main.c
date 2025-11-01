@@ -182,12 +182,16 @@ void Calculate_Odometry(float dt)
     motor2.velocity = v2;
     motor3.velocity = v3;
 
-    // Forward kinematics matching Arduino reference: v1=-vx, v2/v3=0.5*vx±sqrt3/2*vy
-    // From v1=-vx+r*ω, derive: vx = -v1 + r*ω
-    // Simplified: vx = -v1 when ω≈0
-    robot.vx = -v1;  // TODO: May need proper 3-wheel forward kinematics formula
-    robot.vy = (v3 - v2) / sqrtf(3.0f);  // v3 is left (120°), v2 is right (240°)
-    robot.omega = (v1 + v2 + v3) / (3.0f * ROBOT_RADIUS_M);
+    // Forward kinematics: M1=180°, M2=90°, M3=0°
+    // Using standard 3-wheel omni forward kinematics:
+    // vx = (2*v3 - v2 - sqrt(2)*v1) / 4? Better: solve vx from individual wheels
+    // For M1(180°): v1 = vx*(-1) + 0*vy, so vx = -v1
+    // For M2(90°): v2 = 0*vx + 1*vy, so vy = v2
+    // For M3(0°): v3 = 1*vx + 0*vy, so vx = v3
+    // Average vx from M1 and M3: vx = (v3 - v1) / 2
+    robot.vx = (v3 - v1) / 2.0f;  // M3 forward (0°) minus M1 backward (180°)
+    robot.vy = v2;  // M2 left (90°)
+    robot.omega = (v1 + v2 + v3) / (3.0f * ROBOT_RADIUS_M);  // rotation from all wheels
 
     robot.theta += robot.omega * dt;
 
@@ -360,10 +364,10 @@ void UpdateClosedLoopControl(void) {
     vy = fmaxf(fminf(vy, max_speed), -max_speed);
     omega = fmaxf(fminf(omega, max_speed), -max_speed);
 
-    // Arduino reference kinematics: v1 = -vel_x, v2/v3 = 0.5*vel_x ± sqrt(3)/2*vel_y
-    float w1 = -vx + ROBOT_RADIUS_M * omega;
-    float w2 = 0.5f * vx - (sqrtf(3.0f) / 2.0f) * vy + ROBOT_RADIUS_M * omega;  // v2 is right (240°)
-    float w3 = 0.5f * vx + (sqrtf(3.0f) / 2.0f) * vy + ROBOT_RADIUS_M * omega;  // v3 is left (120°)
+    // Physical layout: M1=180°, M2=90°, M3=0°
+    float w1 = vx * cosf(180.0f * M_PI / 180.0f) + vy * sinf(180.0f * M_PI / 180.0f) + ROBOT_RADIUS_M * omega;
+    float w2 = vx * cosf(90.0f * M_PI / 180.0f) + vy * sinf(90.0f * M_PI / 180.0f) + ROBOT_RADIUS_M * omega;
+    float w3 = vx * cosf(0.0f * M_PI / 180.0f) + vy * sinf(0.0f * M_PI / 180.0f) + ROBOT_RADIUS_M * omega;
 
     // Normalize so largest magnitude is 1
     float max_mag = fmaxf(fmaxf(fabsf(w1), fabsf(w2)), fabsf(w3));
