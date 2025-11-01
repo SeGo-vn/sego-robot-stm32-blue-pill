@@ -182,8 +182,10 @@ void Calculate_Odometry(float dt)
     motor2.velocity = v2;
     motor3.velocity = v3;
 
+    // Forward kinematics for 3-wheel omni: v1=0°, v2=240°, v3=120°
+    // vx = (2*v1 - v2 - v3) / 3, vy = (v3 - v2) / sqrt(3), omega = (v1 + v2 + v3) / (3*r)
     robot.vx = (2.0f * v1 - v2 - v3) / 3.0f;
-    robot.vy = (v2 - v3) / sqrtf(3.0f);
+    robot.vy = (v3 - v2) / sqrtf(3.0f);  // Corrected: v3 is left (120°), v2 is right (240°)
     robot.omega = (v1 + v2 + v3) / (3.0f * ROBOT_RADIUS_M);
 
     robot.theta += robot.omega * dt;
@@ -357,10 +359,10 @@ void UpdateClosedLoopControl(void) {
     vy = fmaxf(fminf(vy, max_speed), -max_speed);
     omega = fmaxf(fminf(omega, max_speed), -max_speed);
 
-    // Omni wheel inverse kinematics (same formulas as ROS bridge)
+    // Omni wheel inverse kinematics: v1=0°, v2=240°, v3=120°
     float w1 = vx + ROBOT_RADIUS_M * omega;
-    float w2 = -0.5f * vx + (sqrtf(3.0f) / 2.0f) * vy + ROBOT_RADIUS_M * omega;
-    float w3 = -0.5f * vx - (sqrtf(3.0f) / 2.0f) * vy + ROBOT_RADIUS_M * omega;
+    float w2 = -0.5f * vx - (sqrtf(3.0f) / 2.0f) * vy + ROBOT_RADIUS_M * omega;  // v2 is right (240°)
+    float w3 = -0.5f * vx + (sqrtf(3.0f) / 2.0f) * vy + ROBOT_RADIUS_M * omega;  // v3 is left (120°)
 
     // Normalize so largest magnitude is 1
     float max_mag = fmaxf(fmaxf(fabsf(w1), fabsf(w2)), fabsf(w3));
