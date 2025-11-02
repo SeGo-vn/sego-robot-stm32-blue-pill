@@ -6,7 +6,7 @@ extern TIM_HandleTypeDef htim1;
 
 static uint16_t motor_pwm_period = 0;
 
-static void MotorControl_WritePins(GPIO_TypeDef *port, uint16_t pin_a, uint16_t pin_b, MotorDirection direction)
+void MotorControl_WritePins(GPIO_TypeDef *port, uint16_t pin_a, uint16_t pin_b, MotorDirection direction)
 {
     switch (direction) {
     case MOTOR_DIRECTION_FORWARD:
@@ -32,7 +32,7 @@ void MotorControl_InitPwm(void)
     HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_3);
 }
 
-static void MotorControl_SetDuty(uint8_t motor_index, float duty)
+void MotorControl_SetDuty(uint8_t motor_index, float duty)
 {
     if (duty < 0.0f) {
         duty = 0.0f;
@@ -91,6 +91,19 @@ void MotorControl_Command(uint8_t motor_index, float speed)
     } else if (speed < 0.0f) {
         direction = MOTOR_DIRECTION_REVERSE;
     }
-    MotorControl_Set(motor_index, direction);
+    
+    // Don't call MotorControl_Set as it resets PWM to 1.0
+    // Set direction and PWM directly
+    switch (motor_index) {
+        case 1:
+            MotorControl_WritePins(W1_A_GPIO_Port, W1_A_Pin, W1_B_Pin, direction);
+            break;
+        case 2:
+            MotorControl_WritePins(W2_A_GPIO_Port, W2_A_Pin, W2_B_Pin, direction);
+            break;
+        case 3:
+            MotorControl_WritePins(W3_A_GPIO_Port, W3_A_Pin, W3_B_Pin, direction);
+            break;
+    }
     MotorControl_SetDuty(motor_index, fabsf(speed));
 }

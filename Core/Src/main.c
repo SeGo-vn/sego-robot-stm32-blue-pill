@@ -97,6 +97,7 @@ char command_buffer[64];
 typedef struct {
     uint8_t active;
     MotorDirection direction;
+    float duty;  // PWM duty cycle (0.0 to 1.0)
     uint32_t end_time;
 } MotorTimer;
 
@@ -282,9 +283,41 @@ static void MotorTimer_Set(uint8_t motor_index, MotorDirection direction, uint32
     } else {
         motor_timers[motor_index].active = 1;
         motor_timers[motor_index].direction = direction;
+        motor_timers[motor_index].duty = 1.0f;  // Full power by default
         motor_timers[motor_index].end_time = HAL_GetTick() + duration_ms;
     }
     MotorControl_Set(motor_index + 1, direction);
+}
+
+static void MotorTimer_SetPwm(uint8_t motor_index, MotorDirection direction, float duty, uint32_t duration_ms)
+{
+    if (motor_index >= 3) {
+        return;
+    }
+    if (direction == MOTOR_DIRECTION_STOP || duration_ms == 0) {
+        motor_timers[motor_index].active = 0;
+    } else {
+        motor_timers[motor_index].active = 1;
+        motor_timers[motor_index].direction = direction;
+        motor_timers[motor_index].duty = duty;  // Custom PWM
+        motor_timers[motor_index].end_time = HAL_GetTick() + duration_ms;
+    }
+    
+    // Set direction and PWM directly
+    switch (motor_index) {
+        case 0:
+            MotorControl_WritePins(W1_A_GPIO_Port, W1_A_Pin, W1_B_Pin, direction);
+            MotorControl_SetDuty(1, duty);
+            break;
+        case 1:
+            MotorControl_WritePins(W2_A_GPIO_Port, W2_A_Pin, W2_B_Pin, direction);
+            MotorControl_SetDuty(2, duty);
+            break;
+        case 2:
+            MotorControl_WritePins(W3_A_GPIO_Port, W3_A_Pin, W3_B_Pin, direction);
+            MotorControl_SetDuty(3, duty);
+            break;
+    }
 }
 
 static void Send_Response(const char *message)
@@ -511,6 +544,78 @@ void Process_Command(const char *command)
         }
         MotorTimer_Set((uint8_t)(motor_idx - 1), direction, duration_ms);
         Send_Response("OK RUNM\r\n");
+        return;
+    }
+
+    if (strcmp(token, "RUNP") == 0) {
+        // RUNP command: RUNP dir1 dir2 dir3 pwm duration_ms
+        char *param1 = strtok(NULL, " ,");
+        char *param2 = strtok(NULL, " ,");
+        char *param3 = strtok(NULL, " ,");
+        char *param4 = strtok(NULL, " ,");
+        char *param5 = strtok(NULL, " ,");
+        if (param1 == NULL || param2 == NULL) {
+            Send_Response("ERR RUNP params\r\n");
+            return;
+        }
+        MotorDirection directions[3];
+        float duty = 0.0f;
+        uint32_t duration_ms = 0;
+        uint8_t valid = 0;
+        
+        if (param3 != NULL && param4 != NULL && param5 != NULL && strtok(NULL, " ,") == NULL) {
+            // 5-param version: dir1 dir2 dir3 pwm duration
+            directions[0] = Direction_FromToken(param1, &valid);
+            if (!valid) {
+                Send_Response("ERR RUNP dir1\r\n");
+                return;
+            }
+            directions[1] = Direction_FromToken(param2, &valid);
+            if (!valid) {
+                Send_Response("ERR RUNP dir2\r\n");
+                return;
+            }
+            directions[2] = Direction_FromToken(param3, &valid);
+            if (!valid) {
+                Send_Response("ERR RUNP dir3\r\n");
+                return;
+            }
+            duty = atof(param4);
+            if (duty <= 0.0f || duty > 1.0f) {
+                Send_Response("ERR RUNP pwm\r\n");
+                return;
+            }
+            if (!ParseDurationMs(param5, &duration_ms)) {
+                Send_Response("ERR RUNP duration\r\n");
+                return;
+            }
+        } else if (param3 != NULL && param4 == NULL) {
+            // 3-param version: dir pwm duration
+            directions[0] = Direction_FromToken(param1, &valid);
+            if (!valid) {
+                Send_Response("ERR RUNP dir\r\n");
+                return;
+            }
+            duty = atof(param2);
+            if (duty <= 0.0f || duty > 1.0f) {
+                Send_Response("ERR RUNP pwm\r\n");
+                return;
+            }
+            if (!ParseDurationMs(param3, &duration_ms)) {
+                Send_Response("ERR RUNP duration\r\n");
+                return;
+            }
+            directions[1] = directions[0];
+            directions[2] = directions[0];
+        } else {
+            Send_Response("ERR RUNP format\r\n");
+            return;
+        }
+        MotorTimers_ClearAll();
+        for (uint8_t i = 0; i < 3; ++i) {
+            MotorTimer_SetPwm(i, directions[i], duty, duration_ms);
+        }
+        Send_Response("OK RUNP\r\n");
         return;
     }
 
