@@ -46,7 +46,7 @@
 #define WHEEL_CIRCUMFERENCE_M   (M_PI * WHEEL_DIAMETER_M)  // 0.182 meters
 #define ROBOT_RADIUS_M          0.105   // 10.5cm from center to wheel
 // Empirical scale so encoder odometry matches 10/20cm tape tests (actual ≈ 77-86% of requested travel)
-#define ODOM_DISTANCE_SCALE     1.019798f  // Calibrated from 0.30 m test (0.45 PWM, 4s)
+#define ODOM_DISTANCE_SCALE     0.902521f  // Updated from MOVE calibration (~0.885m actual for 1.0m odom)
 #define METERS_PER_COUNT        ((WHEEL_CIRCUMFERENCE_M / COUNTS_PER_WHEEL_REV) * ODOM_DISTANCE_SCALE)
 #define ODOMETRY_UPDATE_HZ      50      // Calculate odometry 50 times per second
 #define ODOMETRY_UPDATE_MS      (1000 / ODOMETRY_UPDATE_HZ)
@@ -620,7 +620,7 @@ void UpdateMoveControl(void) {
     const float MIN_PWM = 0.46f;
     const float MAX_PWM = 0.70f;
     const float OUTPUT_SMOOTHING = 0.25f;
-    const float BASE_DRIVE_SKEW = 0.03f; // Bias to counter left drift
+    const float BASE_DRIVE_SKEW = 0.015f; // Bias to counter left drift
 
     int32_t error = motor1.delta_count + motor2.delta_count + motor3.delta_count;
 
