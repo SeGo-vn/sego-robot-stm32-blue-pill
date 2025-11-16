@@ -96,12 +96,15 @@ void MotorControl_Command(uint8_t motor_index, float speed)
     // Set direction and PWM directly
     switch (motor_index) {
         case 1:
+            HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1);
             MotorControl_WritePins(W1_A_GPIO_Port, W1_A_Pin, W1_B_Pin, direction);
             break;
         case 2:
+            HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_2);
             MotorControl_WritePins(W2_A_GPIO_Port, W2_A_Pin, W2_B_Pin, direction);
             break;
         case 3:
+            HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_3);
             MotorControl_WritePins(W3_A_GPIO_Port, W3_A_Pin, W3_B_Pin, direction);
             break;
     }

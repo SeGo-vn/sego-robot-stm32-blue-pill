@@ -46,11 +46,16 @@
 #define WHEEL_CIRCUMFERENCE_M   (M_PI * WHEEL_DIAMETER_M)  // 0.182 meters
 #define ROBOT_RADIUS_M          0.105   // 10.5cm from center to wheel
 // Empirical scale so encoder odometry matches 10/20cm tape tests (actual ≈ 77-86% of requested travel)
-#define ODOM_DISTANCE_SCALE     0.872947f  // Calibrated from 0.187 m / 0.1778 m
+#define ODOM_DISTANCE_SCALE     1.019798f  // Calibrated from 0.30 m test (0.45 PWM, 4s)
 #define METERS_PER_COUNT        ((WHEEL_CIRCUMFERENCE_M / COUNTS_PER_WHEEL_REV) * ODOM_DISTANCE_SCALE)
 #define ODOMETRY_UPDATE_HZ      50      // Calculate odometry 50 times per second
 #define ODOMETRY_UPDATE_MS      (1000 / ODOMETRY_UPDATE_HZ)
 #define UART_BAUD_RATE          115200  // Baud rate for Raspberry Pi communication
+#define DEG2RAD(x)              ((x) * (float)M_PI / 180.0f)
+
+// Wheel geometry mapped to motor indices (motor1 right/back, motor2 front, motor3 left/back)
+static const float wheel_position_angles_deg[3] = { 60.0f, 180.0f, 300.0f };
+static const float wheel_drive_angles_deg[3]    = { 150.0f, 270.0f, 30.0f };
 //THEANH END
 /* USER CODE END PD */
 
@@ -112,9 +117,41 @@ typedef struct {
     float tolerance_angle;     // radians
     uint32_t timeout_ms;
     uint32_t start_time;
+    uint8_t debug_logged_start;
+    uint32_t last_debug_time;
 } ClosedLoopTarget;
 
 ClosedLoopTarget closed_loop_target = {0};
+typedef struct {
+    uint8_t active;
+    uint32_t end_time;
+    float target_theta;
+    float base_pwm;
+    uint32_t last_debug_time;
+} TimedForwardTarget;
+
+TimedForwardTarget timed_forward_target = {0};
+
+typedef struct {
+    uint8_t active;
+    float target_distance;
+    float start_x;
+    float start_y;
+    float start_theta;
+    float base_pwm;
+    uint32_t timeout_ms;
+    uint32_t start_time;
+    // PID state
+    float pid_integral;
+    float pid_previous_error;
+    float pid_filtered_output;
+} MoveTarget;
+
+MoveTarget move_target = {0};
+
+static const float TIMED_HEADING_GAIN = 0.6f;
+float wheel_to_body_mat[3][3];   // Maps chassis twist to wheel speeds
+float body_from_wheel_mat[3][3]; // Maps wheel speeds back to chassis twist
 //THEANH END
 /* USER CODE END PV */
 
@@ -136,6 +173,11 @@ void MotorTimers_Update(void);
 static int32_t Encoder_ComputeDelta(int32_t current_count, int32_t previous_count);
 uint8_t IsAtTarget(void);
 void UpdateClosedLoopControl(void);
+void UpdateTimedForwardControl(void);
+void UpdateMoveControl(void);
+void Kinematics_Init(void);
+static void Mat3MulVec(const float m[3][3], const float v[3], float out[3]);
+static uint8_t Mat3Inverse(const float m[3][3], float inv[3][3]);
 //THEANH END
 /* USER CODE END PFP */
 
@@ -170,6 +212,65 @@ void Read_Encoders(void)
     motor2.prev_count = motor2.count;
     motor3.prev_count = motor3.count;
 }
+
+static void Mat3MulVec(const float m[3][3], const float v[3], float out[3])
+{
+    for (uint8_t i = 0; i < 3; ++i) {
+        out[i] = m[i][0] * v[0] + m[i][1] * v[1] + m[i][2] * v[2];
+    }
+}
+
+static uint8_t Mat3Inverse(const float m[3][3], float inv[3][3])
+{
+    float det = m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1])
+              - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
+              + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]);
+
+    if (fabsf(det) < 1e-6f) {
+        return 0;
+    }
+
+    float inv_det = 1.0f / det;
+    inv[0][0] =  (m[1][1] * m[2][2] - m[1][2] * m[2][1]) * inv_det;
+    inv[0][1] = -(m[0][1] * m[2][2] - m[0][2] * m[2][1]) * inv_det;
+    inv[0][2] =  (m[0][1] * m[1][2] - m[0][2] * m[1][1]) * inv_det;
+
+    inv[1][0] = -(m[1][0] * m[2][2] - m[1][2] * m[2][0]) * inv_det;
+    inv[1][1] =  (m[0][0] * m[2][2] - m[0][2] * m[2][0]) * inv_det;
+    inv[1][2] = -(m[0][0] * m[1][2] - m[0][2] * m[1][0]) * inv_det;
+
+    inv[2][0] =  (m[1][0] * m[2][1] - m[1][1] * m[2][0]) * inv_det;
+    inv[2][1] = -(m[0][0] * m[2][1] - m[0][1] * m[2][0]) * inv_det;
+    inv[2][2] =  (m[0][0] * m[1][1] - m[0][1] * m[1][0]) * inv_det;
+    return 1;
+}
+
+void Kinematics_Init(void)
+{
+    // Build kinematic rows in physical order: front (motor2), left (motor3), right (motor1)
+    const uint8_t order[3] = {1, 2, 0}; // indices into wheel_*_angles arrays
+    for (uint8_t row = 0; row < 3; ++row) {
+        uint8_t i = order[row];
+        float drive_rad = DEG2RAD(wheel_drive_angles_deg[i]);
+        float pos_rad = DEG2RAD(wheel_position_angles_deg[i]);
+        float tx = cosf(drive_rad);
+        float ty = sinf(drive_rad);
+        float rx = ROBOT_RADIUS_M * cosf(pos_rad);
+        float ry = ROBOT_RADIUS_M * sinf(pos_rad);
+
+        wheel_to_body_mat[row][0] = tx;
+        wheel_to_body_mat[row][1] = ty;
+        wheel_to_body_mat[row][2] = -ry * tx + rx * ty;
+    }
+
+    if (!Mat3Inverse(wheel_to_body_mat, body_from_wheel_mat)) {
+        for (uint8_t r = 0; r < 3; ++r) {
+            for (uint8_t c = 0; c < 3; ++c) {
+                body_from_wheel_mat[r][c] = (r == c) ? 1.0f : 0.0f;
+            }
+        }
+    }
+}
 void Calculate_Odometry(float dt)
 {
     if (dt <= 0) return;  // Avoid division by zero
@@ -183,16 +284,13 @@ void Calculate_Odometry(float dt)
     motor2.velocity = v2;
     motor3.velocity = v3;
 
-    // Forward kinematics: M1=180°, M2=90°, M3=0°
-    // Using standard 3-wheel omni forward kinematics:
-    // vx = (2*v3 - v2 - sqrt(2)*v1) / 4? Better: solve vx from individual wheels
-    // For M1(180°): v1 = vx*(-1) + 0*vy, so vx = -v1
-    // For M2(90°): v2 = 0*vx + 1*vy, so vy = v2
-    // For M3(0°): v3 = 1*vx + 0*vy, so vx = v3
-    // Average vx from M1 and M3: vx = (v3 - v1) / 2
-    robot.vx = (v3 - v1) / 2.0f;  // M3 forward (0°) minus M1 backward (180°)
-    robot.vy = v2;  // M2 left (90°)
-    robot.omega = -(v1 + v2 + v3) / (3.0f * ROBOT_RADIUS_M);  // rotation from all wheels (negated to fix left/right swap)
+    float wheel_vector[3] = {v1, v2, v3};
+    float body_vector[3] = {0.0f};
+    Mat3MulVec(body_from_wheel_mat, wheel_vector, body_vector);
+
+    robot.vx = body_vector[0];
+    robot.vy = body_vector[1];
+    robot.omega = body_vector[2];
 
     robot.theta += robot.omega * dt;
 
@@ -348,9 +446,9 @@ uint8_t IsAtTarget(void) {
 
 void UpdateClosedLoopControl(void) {
     if (!closed_loop_target.active) return;
-    
+
     uint32_t now = HAL_GetTick();
-    
+
     // Check timeout
     if ((now - closed_loop_target.start_time) > closed_loop_target.timeout_ms) {
         closed_loop_target.active = 0;
@@ -358,7 +456,7 @@ void UpdateClosedLoopControl(void) {
         Send_Response("TIMEOUT\r\n");
         return;
     }
-    
+
     // Check if target reached
     if (IsAtTarget()) {
         closed_loop_target.active = 0;
@@ -366,13 +464,14 @@ void UpdateClosedLoopControl(void) {
         Send_Response("TARGET_REACHED\r\n");
         return;
     }
-    
+
     // Proportional error
     float dx = closed_loop_target.target_x - robot.x;
     float dy = closed_loop_target.target_y - robot.y;
     float dtheta = closed_loop_target.target_theta - robot.theta;
     while (dtheta > M_PI) dtheta -= 2.0f * M_PI;
     while (dtheta < -M_PI) dtheta += 2.0f * M_PI;
+    float distance_error = sqrtf(dx*dx + dy*dy);
 
     // Convert world error into robot frame
     float cos_theta = cosf(robot.theta);
@@ -380,13 +479,12 @@ void UpdateClosedLoopControl(void) {
     float dx_robot = dx * cos_theta + dy * sin_theta;
     float dy_robot = -dx * sin_theta + dy * cos_theta;
 
-    // Gain settings (tune experimentally)
-    const float linear_k = 1.0f;   // proportional gain for translation
-    const float angular_k = 0.8f;  // proportional gain for heading
-    const float max_speed = 1.0f;  // clamp speed commands to [-1, 1]
-    const float deadband = 0.01f;  // ignore very small commands
-    const float min_duty_linear = 0.18f;   // minimum duty for translation
-    const float min_duty_rotate = 0.08f;   // minimum duty for pure rotation
+    // Gain settings
+    const float linear_k = 1.0f;
+    const float angular_k = 0.8f;
+    const float max_speed = 0.8f;
+    const float min_duty_linear = 0.45f; // From user's manual test
+    const float min_duty_rotate = 0.08f;
 
     float vx = linear_k * dx_robot;
     float vy = linear_k * dy_robot;
@@ -397,44 +495,196 @@ void UpdateClosedLoopControl(void) {
     vy = fmaxf(fminf(vy, max_speed), -max_speed);
     omega = fmaxf(fminf(omega, max_speed), -max_speed);
 
-    // Physical layout: M1=180°, M2=90°, M3=0°
-    float w1 = vx * cosf(180.0f * M_PI / 180.0f) + vy * sinf(180.0f * M_PI / 180.0f) + ROBOT_RADIUS_M * omega;
-    float w2 = vx * cosf(90.0f * M_PI / 180.0f) + vy * sinf(90.0f * M_PI / 180.0f) + ROBOT_RADIUS_M * omega;
-    float w3 = vx * cosf(0.0f * M_PI / 180.0f) + vy * sinf(0.0f * M_PI / 180.0f) + ROBOT_RADIUS_M * omega;
+    if (!closed_loop_target.debug_logged_start) {
+        sprintf(uart_buffer,
+                "CL START tgt=(%.3f,%.3f,%.3f) cur=(%.3f,%.3f,%.3f)\r\n",
+                closed_loop_target.target_x,
+                closed_loop_target.target_y,
+                closed_loop_target.target_theta,
+                robot.x, robot.y, robot.theta);
+        HAL_UART_Transmit(&huart3, (uint8_t*)uart_buffer, strlen(uart_buffer), 100);
+        closed_loop_target.debug_logged_start = 1;
+        closed_loop_target.last_debug_time = now;
+    }
 
-    // Normalize so largest magnitude is 1
-    float max_mag = fmaxf(fmaxf(fabsf(w1), fabsf(w2)), fabsf(w3));
+    float twist_cmd[3] = {vx, vy, omega};
+    float wheel_cmds[3] = {0.0f};
+    Mat3MulVec(wheel_to_body_mat, twist_cmd, wheel_cmds);
+
+
+    float max_mag = fmaxf(fmaxf(fabsf(wheel_cmds[0]), fabsf(wheel_cmds[1])), fabsf(wheel_cmds[2]));
     if (max_mag > 1.0f) {
-        w1 /= max_mag;
-        w2 /= max_mag;
-        w3 /= max_mag;
+        wheel_cmds[0] /= max_mag;
+        wheel_cmds[1] /= max_mag;
+        wheel_cmds[2] /= max_mag;
     }
 
-    int rotating_only = (fabsf(vx) < deadband && fabsf(vy) < deadband && fabsf(omega) >= deadband);
-    float min_duty = rotating_only ? min_duty_rotate : min_duty_linear;
-
-    if (fabsf(w1) < deadband) {
-        w1 = 0.0f;
-    } else if (fabsf(w1) < min_duty) {
-        w1 = copysignf(min_duty, w1);
-    }
-    if (fabsf(w2) < deadband) {
-        w2 = 0.0f;
-    } else if (fabsf(w2) < min_duty) {
-        w2 = copysignf(min_duty, w2);
-    }
-    if (fabsf(w3) < deadband) {
-        w3 = 0.0f;
-    } else if (fabsf(w3) < min_duty) {
-        w3 = copysignf(min_duty, w3);
+    // Apply deadband and remap to [min_duty, 1.0]
+    float min_duty = (fabsf(dtheta) > 0.1f && distance_error < 0.05f) ? min_duty_rotate : min_duty_linear;
+    for (int i = 0; i < 3; i++) {
+        float speed = wheel_cmds[i];
+        if (fabsf(speed) > 0.01f) { // If not in deadband
+            // Remap [0, 1] output to [min_duty, 1.0]
+            float remapped_speed = min_duty + fabsf(speed) * (1.0f - min_duty);
+            wheel_cmds[i] = (speed > 0) ? remapped_speed : -remapped_speed;
+        }
     }
 
-    MotorControl_Command(1, w1);
-    MotorControl_Command(2, w2);
-    MotorControl_Command(3, w3);
+    if (now - closed_loop_target.last_debug_time >= 200) {
+        sprintf(uart_buffer,
+                "CL CMD dist=%.3f dth=%.3f body=(%.3f,%.3f,%.3f) wheels=(%.2f,%.2f,%.2f)\r\n",
+                distance_error,
+                dtheta,
+                vx, vy, omega,
+                wheel_cmds[0], wheel_cmds[1], wheel_cmds[2]);
+        HAL_UART_Transmit(&huart3, (uint8_t*)uart_buffer, strlen(uart_buffer), 100);
+        closed_loop_target.last_debug_time = now;
+    }
+
+    MotorControl_Command(2, wheel_cmds[0]); // row0: front wheel (motor 2)
+    MotorControl_Command(3, wheel_cmds[1]); // row1: left wheel (motor 3)
+    MotorControl_Command(1, wheel_cmds[2]); // row2: right wheel (motor 1)
 }
 //THEANH END
 
+void UpdateTimedForwardControl(void) {
+    if (!timed_forward_target.active) return;
+    uint32_t now = HAL_GetTick();
+    if (now >= timed_forward_target.end_time) {
+        timed_forward_target.active = 0;
+        MotorControl_SetAll(MOTOR_DIRECTION_STOP, MOTOR_DIRECTION_STOP, MOTOR_DIRECTION_STOP);
+        Send_Response("TIMED_DONE\r\n");
+        return;
+    }
+
+    float dtheta = timed_forward_target.target_theta - robot.theta;
+    while (dtheta > M_PI) dtheta -= 2.0f * M_PI;
+    while (dtheta < -M_PI) dtheta += 2.0f * M_PI;
+
+    float correction = TIMED_HEADING_GAIN * dtheta;
+    float motor1_cmd = -timed_forward_target.base_pwm + correction;
+    float motor2_cmd = 0.0f;
+    float motor3_cmd =  timed_forward_target.base_pwm + correction;
+
+    if (motor1_cmd > 1.0f) motor1_cmd = 1.0f;
+    if (motor1_cmd < -1.0f) motor1_cmd = -1.0f;
+    if (motor3_cmd > 1.0f) motor3_cmd = 1.0f;
+    if (motor3_cmd < -1.0f) motor3_cmd = -1.0f;
+
+    const float min_duty = 0.20f;
+    if (fabsf(motor1_cmd) > 0.0f && fabsf(motor1_cmd) < min_duty)
+        motor1_cmd = copysignf(min_duty, motor1_cmd);
+    if (fabsf(motor3_cmd) > 0.0f && fabsf(motor3_cmd) < min_duty)
+        motor3_cmd = copysignf(min_duty, motor3_cmd);
+
+    MotorControl_Command(1, motor1_cmd);
+    MotorControl_Command(2, motor2_cmd);
+    MotorControl_Command(3, motor3_cmd);
+
+    if (now - timed_forward_target.last_debug_time >= 250) {
+        sprintf(uart_buffer,
+                "TIMED CMD theta_err=%.3f cmds=(%.2f,%.2f,%.2f)\r\n",
+                dtheta, motor1_cmd, motor2_cmd, motor3_cmd);
+        HAL_UART_Transmit(&huart3, (uint8_t*)uart_buffer, strlen(uart_buffer), 100);
+        timed_forward_target.last_debug_time = now;
+    }
+}
+
+void UpdateMoveControl(void) {
+    if (!move_target.active) return;
+
+    uint32_t now = HAL_GetTick();
+
+    // Check timeout
+    if ((now - move_target.start_time) > move_target.timeout_ms) {
+        move_target.active = 0;
+        MotorControl_SetAll(MOTOR_DIRECTION_STOP, MOTOR_DIRECTION_STOP, MOTOR_DIRECTION_STOP);
+        Send_Response("MOVE TIMEOUT\r\n");
+        return;
+    }
+
+    float dx = robot.x - move_target.start_x;
+    float dy = robot.y - move_target.start_y;
+    float heading_cos = cosf(move_target.start_theta);
+    float heading_sin = sinf(move_target.start_theta);
+    float forward_progress = dx * heading_cos + dy * heading_sin;
+    if (forward_progress < 0.0f) {
+        forward_progress = 0.0f;
+    }
+    float lateral_error = -dx * heading_sin + dy * heading_cos;
+
+    if (forward_progress >= move_target.target_distance) {
+        move_target.active = 0;
+        MotorControl_SetAll(MOTOR_DIRECTION_STOP, MOTOR_DIRECTION_STOP, MOTOR_DIRECTION_STOP);
+        Send_Response("MOVE TARGET_REACHED\r\n");
+        return;
+    }
+
+    // PID controller for drift correction
+    const float Kp = -0.0040f;
+    const float Ki = -0.00015f;
+    const float Kd = -0.0008f;
+    const float MIN_PWM = 0.46f;
+    const float MAX_PWM = 0.70f;
+    const float OUTPUT_SMOOTHING = 0.25f;
+
+    int32_t error = motor1.delta_count + motor2.delta_count + motor3.delta_count;
+
+    // Proportional term
+    float p_term = Kp * (float)error;
+
+    // Integral term
+    move_target.pid_integral += (float)error;
+    float i_term = Ki * move_target.pid_integral;
+
+    // Derivative term
+    float derivative = (float)error - move_target.pid_previous_error;
+    float d_term = Kd * derivative;
+    move_target.pid_previous_error = (float)error;
+
+    float correction_pwm = p_term + i_term + d_term;
+    // Low-pass filter the PID output so the correction wheel ramps instead of slamming
+    correction_pwm = move_target.pid_filtered_output +
+                     OUTPUT_SMOOTHING * (correction_pwm - move_target.pid_filtered_output);
+    move_target.pid_filtered_output = correction_pwm;
+
+    // Apply deadband compensation
+    if (fabsf(correction_pwm) > 0.01f) { // Only apply correction if error is significant
+        if (correction_pwm > 1.0f) correction_pwm = 1.0f;
+        if (correction_pwm < -1.0f) correction_pwm = -1.0f;
+        float output_pwm = MIN_PWM + fabsf(correction_pwm) * (MAX_PWM - MIN_PWM);
+        if (output_pwm > MAX_PWM) {
+            output_pwm = MAX_PWM;
+        }
+        correction_pwm = copysignf(output_pwm, correction_pwm);
+    }
+
+    const float LATERAL_KP = 1.2f;
+    const float LATERAL_MAX = 0.25f;
+    const float BASE_MIN_OUTPUT = 0.45f;
+    float lateral_correction = LATERAL_KP * lateral_error;
+    if (lateral_correction > LATERAL_MAX) lateral_correction = LATERAL_MAX;
+    if (lateral_correction < -LATERAL_MAX) lateral_correction = -LATERAL_MAX;
+
+    float motor1_cmd = -(move_target.base_pwm + lateral_correction); // Motor 1 Reverse
+    float motor3_cmd =  (move_target.base_pwm - lateral_correction); // Motor 3 Forward
+
+    if (motor1_cmd > 1.0f)  motor1_cmd = 1.0f;
+    if (motor1_cmd < -1.0f) motor1_cmd = -1.0f;
+    if (motor3_cmd > 1.0f)  motor3_cmd = 1.0f;
+    if (motor3_cmd < -1.0f) motor3_cmd = -1.0f;
+
+    if (fabsf(motor1_cmd) > 0.0f && fabsf(motor1_cmd) < BASE_MIN_OUTPUT)
+        motor1_cmd = copysignf(BASE_MIN_OUTPUT, motor1_cmd);
+    if (fabsf(motor3_cmd) > 0.0f && fabsf(motor3_cmd) < BASE_MIN_OUTPUT)
+        motor3_cmd = copysignf(BASE_MIN_OUTPUT, motor3_cmd);
+
+    MotorControl_Command(1, motor1_cmd);
+    MotorControl_Command(3, motor3_cmd);
+    
+    // Apply correction to Motor 2
+    MotorControl_Command(2, correction_pwm);
+}
 void Process_Command(const char *command)
 {
     if (command == NULL) {
@@ -622,12 +872,42 @@ void Process_Command(const char *command)
     if (strcmp(token, "STOP") == 0) {
         MotorTimers_ClearAll();
         closed_loop_target.active = 0; // Stop any active closed-loop control
+        timed_forward_target.active = 0;
+        move_target.active = 0;
         MotorControl_SetAll(MOTOR_DIRECTION_STOP,
                             MOTOR_DIRECTION_STOP,
                             MOTOR_DIRECTION_STOP);
         Send_Response("OK STOP\r\n");
         return;
     }
+
+    if (strcmp(token, "MOVE") == 0) {
+		char *distance_token = strtok(NULL, " ,");
+		if (distance_token == NULL) {
+			Send_Response("ERR MOVE params\r\n");
+			return;
+		}
+		float distance = atof(distance_token);
+		if (distance <= 0.0f) {
+			Send_Response("ERR MOVE distance\r\n");
+			return;
+		}
+
+		move_target.active = 1;
+		move_target.target_distance = distance;
+		move_target.start_x = robot.x;
+		move_target.start_y = robot.y;
+		move_target.start_theta = robot.theta;
+		move_target.base_pwm = 0.64f; // More thrust to reach full meter
+		move_target.timeout_ms = 20000; // 20s timeout
+		move_target.start_time = HAL_GetTick();
+		move_target.pid_integral = 0.0f;
+		move_target.pid_previous_error = 0.0f;
+		move_target.pid_filtered_output = 0.0f;
+
+		Send_Response("OK MOVE\r\n");
+		return;
+	}
 
     //THEANH - New Closed Loop Commands
     if (strcmp(token, "MOVE_DIST") == 0) {
@@ -651,8 +931,45 @@ void Process_Command(const char *command)
         closed_loop_target.tolerance_angle = 0.05;    // ~3 degree tolerance
         closed_loop_target.timeout_ms = 10000;        // 10 second timeout
         closed_loop_target.start_time = HAL_GetTick();
+        closed_loop_target.debug_logged_start = 0;
+        closed_loop_target.last_debug_time = HAL_GetTick();
+Send_Response("Version 18 MOVE_DIST armed\r\n");
+        HAL_UART_Transmit(&huart3, (uint8_t*)uart_buffer, strlen(uart_buffer), 100);
         
         Send_Response("OK MOVE_DIST\r\n");
+        return;
+    }
+
+    if (strcmp(token, "MOVE_TIME") == 0) {
+        char *duration_token = strtok(NULL, " ,");
+        char *pwm_token = strtok(NULL, " ,");
+        if (duration_token == NULL || strtok(NULL, " ,") != NULL) {
+            Send_Response("ERR MOVE_TIME params\r\n");
+            return;
+        }
+        float duration_s = atof(duration_token);
+        if (duration_s <= 0.0f) {
+            Send_Response("ERR MOVE_TIME duration\r\n");
+            return;
+        }
+        float base_pwm = (pwm_token) ? atof(pwm_token) : 0.45f;
+        if (base_pwm <= 0.0f || base_pwm > 1.0f) {
+            Send_Response("ERR MOVE_TIME pwm\r\n");
+            return;
+        }
+
+        MotorTimers_ClearAll();
+        closed_loop_target.active = 0;
+        timed_forward_target.active = 1;
+        timed_forward_target.target_theta = robot.theta;
+        timed_forward_target.base_pwm = base_pwm;
+        timed_forward_target.end_time = HAL_GetTick() + (uint32_t)(duration_s * 1000.0f);
+        timed_forward_target.last_debug_time = HAL_GetTick();
+
+        sprintf(uart_buffer, "Version 13 MOVE_TIME %.2fs pwm=%.2f\r\n", duration_s, base_pwm);
+        HAL_UART_Transmit(&huart3, (uint8_t*)uart_buffer, strlen(uart_buffer), 100);
+
+        Send_Response("OK MOVE_TIME\r\n");
         return;
     }
     
@@ -680,6 +997,8 @@ void Process_Command(const char *command)
         closed_loop_target.tolerance_angle = 0.02;    // ~1 degree tolerance
         closed_loop_target.timeout_ms = 10000;
         closed_loop_target.start_time = HAL_GetTick();
+        closed_loop_target.debug_logged_start = 0;
+        closed_loop_target.last_debug_time = HAL_GetTick();
         
         Send_Response("OK ROTATE_DEG\r\n");
         return;
@@ -754,6 +1073,7 @@ int main(void)
   sprintf(uart_buffer, "STM32 Omni Robot Odometry Started\r\n");
   HAL_UART_Transmit(&huart3, (uint8_t*)uart_buffer, strlen(uart_buffer), 100);
   last_odometry_time = HAL_GetTick();
+  Kinematics_Init();
   HAL_UART_Receive_IT(&huart3, &uart_rx_byte, 1);
   MotorControl_SetAll(MOTOR_DIRECTION_STOP,
                       MOTOR_DIRECTION_STOP,
@@ -774,6 +1094,8 @@ int main(void)
 
 	  MotorTimers_Update();
 	  UpdateClosedLoopControl(); // New closed-loop control update
+	  UpdateTimedForwardControl();
+	  UpdateMoveControl();
 
 	  uint32_t current_time = HAL_GetTick();
 	  if (current_time - last_odometry_time >= ODOMETRY_UPDATE_MS)
