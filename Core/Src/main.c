@@ -137,7 +137,6 @@ typedef struct {
     float target_distance;
     float start_x;
     float start_y;
-    float start_theta;
     float base_pwm;
     uint32_t timeout_ms;
     uint32_t start_time;
@@ -605,15 +604,9 @@ void UpdateMoveControl(void) {
 
     float dx = robot.x - move_target.start_x;
     float dy = robot.y - move_target.start_y;
-    float heading_cos = cosf(move_target.start_theta);
-    float heading_sin = sinf(move_target.start_theta);
-    float forward_progress = dx * heading_cos + dy * heading_sin;
-    if (forward_progress < 0.0f) {
-        forward_progress = 0.0f;
-    }
-    float lateral_error = -dx * heading_sin + dy * heading_cos;
+    float distance_traveled = sqrtf(dx*dx + dy*dy);
 
-    if (forward_progress >= move_target.target_distance) {
+    if (distance_traveled >= move_target.target_distance) {
         move_target.active = 0;
         MotorControl_SetAll(MOTOR_DIRECTION_STOP, MOTOR_DIRECTION_STOP, MOTOR_DIRECTION_STOP);
         Send_Response("MOVE TARGET_REACHED\r\n");
@@ -627,6 +620,7 @@ void UpdateMoveControl(void) {
     const float MIN_PWM = 0.46f;
     const float MAX_PWM = 0.70f;
     const float OUTPUT_SMOOTHING = 0.25f;
+    const float BASE_DRIVE_SKEW = 0.03f; // Bias to counter left drift
 
     int32_t error = motor1.delta_count + motor2.delta_count + motor3.delta_count;
 
@@ -659,25 +653,12 @@ void UpdateMoveControl(void) {
         correction_pwm = copysignf(output_pwm, correction_pwm);
     }
 
-    const float LATERAL_KP = 1.2f;
-    const float LATERAL_MAX = 0.25f;
-    const float BASE_MIN_OUTPUT = 0.45f;
-    float lateral_correction = LATERAL_KP * lateral_error;
-    if (lateral_correction > LATERAL_MAX) lateral_correction = LATERAL_MAX;
-    if (lateral_correction < -LATERAL_MAX) lateral_correction = -LATERAL_MAX;
+    // Apply base PWM to Motor 1 (Reverse) and Motor 3 (Forward) with slight skew for lateral bias
+    float motor1_cmd = -(move_target.base_pwm + BASE_DRIVE_SKEW); // Motor 1 Reverse harder
+    float motor3_cmd =  (move_target.base_pwm - BASE_DRIVE_SKEW); // Motor 3 Forward slightly softer
 
-    float motor1_cmd = -(move_target.base_pwm + lateral_correction); // Motor 1 Reverse
-    float motor3_cmd =  (move_target.base_pwm - lateral_correction); // Motor 3 Forward
-
-    if (motor1_cmd > 1.0f)  motor1_cmd = 1.0f;
     if (motor1_cmd < -1.0f) motor1_cmd = -1.0f;
     if (motor3_cmd > 1.0f)  motor3_cmd = 1.0f;
-    if (motor3_cmd < -1.0f) motor3_cmd = -1.0f;
-
-    if (fabsf(motor1_cmd) > 0.0f && fabsf(motor1_cmd) < BASE_MIN_OUTPUT)
-        motor1_cmd = copysignf(BASE_MIN_OUTPUT, motor1_cmd);
-    if (fabsf(motor3_cmd) > 0.0f && fabsf(motor3_cmd) < BASE_MIN_OUTPUT)
-        motor3_cmd = copysignf(BASE_MIN_OUTPUT, motor3_cmd);
 
     MotorControl_Command(1, motor1_cmd);
     MotorControl_Command(3, motor3_cmd);
@@ -897,8 +878,7 @@ void Process_Command(const char *command)
 		move_target.target_distance = distance;
 		move_target.start_x = robot.x;
 		move_target.start_y = robot.y;
-		move_target.start_theta = robot.theta;
-		move_target.base_pwm = 0.64f; // More thrust to reach full meter
+		move_target.base_pwm = 0.58f; // Slightly higher to hit full meter
 		move_target.timeout_ms = 20000; // 20s timeout
 		move_target.start_time = HAL_GetTick();
 		move_target.pid_integral = 0.0f;
