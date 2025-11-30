@@ -52,6 +52,7 @@
 #define ODOMETRY_UPDATE_MS      (1000 / ODOMETRY_UPDATE_HZ)
 #define UART_BAUD_RATE          115200  // Baud rate for Raspberry Pi communication
 #define DEG2RAD(x)              ((x) * (float)M_PI / 180.0f)
+#define ANGULAR_RATE_TOL        0.05f   // rad/s tolerance for declaring rotation complete
 
 // Wheel geometry mapped to motor indices (motor1 right/back, motor2 front, motor3 left/back)
 static const float wheel_position_angles_deg[3] = { 60.0f, 180.0f, 300.0f };
@@ -438,9 +439,12 @@ uint8_t IsAtTarget(void) {
     while (angle_error > M_PI) angle_error -= 2.0f * M_PI;
     while (angle_error < -M_PI) angle_error += 2.0f * M_PI;
     angle_error = fabsf(angle_error);
+
+    float angular_rate = fabsf(robot.omega);
     
     return (distance_error < closed_loop_target.tolerance_distance && 
-            angle_error < closed_loop_target.tolerance_angle);
+            angle_error < closed_loop_target.tolerance_angle &&
+            angular_rate < ANGULAR_RATE_TOL);
 }
 
 void UpdateClosedLoopControl(void) {
@@ -480,10 +484,11 @@ void UpdateClosedLoopControl(void) {
 
     // Gain settings
     const float linear_k = 1.0f;
-    const float angular_k = 0.8f;
+    const float angular_k = 0.55f;
     const float max_speed = 0.8f;
     const float min_duty_linear = 0.45f; // From user's manual test
-    const float min_duty_rotate = 0.08f;
+    const float min_duty_rotate = 0.48f; // Slightly above friction threshold
+    const float min_duty_brake = 0.18f;
 
     float vx = linear_k * dx_robot;
     float vy = linear_k * dy_robot;
@@ -519,7 +524,18 @@ void UpdateClosedLoopControl(void) {
     }
 
     // Apply deadband and remap to [min_duty, 1.0]
-    float min_duty = (fabsf(dtheta) > 0.1f && distance_error < 0.05f) ? min_duty_rotate : min_duty_linear;
+    float min_duty = min_duty_linear;
+    if (distance_error < 0.05f) {
+        float angle_mag = fabsf(dtheta);
+        if (angle_mag >= 0.4f) {
+            min_duty = min_duty_rotate;
+        } else {
+            float frac = angle_mag / 0.4f;
+            if (frac < 0.0f) frac = 0.0f;
+            if (frac > 1.0f) frac = 1.0f;
+            min_duty = min_duty_brake + frac * (min_duty_rotate - min_duty_brake);
+        }
+    }
     for (int i = 0; i < 3; i++) {
         float speed = wheel_cmds[i];
         if (fabsf(speed) > 0.01f) { // If not in deadband
@@ -859,6 +875,35 @@ void Process_Command(const char *command)
                             MOTOR_DIRECTION_STOP,
                             MOTOR_DIRECTION_STOP);
         Send_Response("OK STOP\r\n");
+        return;
+    }
+
+    if (strcmp(token, "RESET_ODOM") == 0) {
+        MotorTimers_ClearAll();
+        closed_loop_target.active = 0;
+        timed_forward_target.active = 0;
+        move_target.active = 0;
+
+        robot.x = 0.0f;
+        robot.y = 0.0f;
+        robot.theta = 0.0f;
+        robot.vx = 0.0f;
+        robot.vy = 0.0f;
+        robot.omega = 0.0f;
+        last_odometry_time = HAL_GetTick();
+
+        motor1.prev_count = motor1.count = (int32_t)__HAL_TIM_GET_COUNTER(&htim2);
+        motor2.prev_count = motor2.count = (int32_t)__HAL_TIM_GET_COUNTER(&htim3);
+        motor3.prev_count = motor3.count = (int32_t)__HAL_TIM_GET_COUNTER(&htim4);
+        motor1.delta_count = 0;
+        motor2.delta_count = 0;
+        motor3.delta_count = 0;
+
+        move_target.pid_integral = 0.0f;
+        move_target.pid_previous_error = 0.0f;
+        move_target.pid_filtered_output = 0.0f;
+
+        Send_Response("OK RESET_ODOM\r\n");
         return;
     }
 
