@@ -152,6 +152,81 @@ MoveTarget move_target = {0};
 static const float TIMED_HEADING_GAIN = 0.6f;
 float wheel_to_body_mat[3][3];   // Maps chassis twist to wheel speeds
 float body_from_wheel_mat[3][3]; // Maps wheel speeds back to chassis twist
+
+// Configurable parameters (can be set via SET_PARAM command from Python)
+typedef struct {
+    // Odometry calibration
+    float odom_distance_scale;
+    
+    // Closed-loop position control
+    float linear_k;
+    float angular_k;
+    float max_speed;
+    float min_duty_linear;
+    float min_duty_rotate;
+    float min_duty_brake;
+    
+    // MOVE PID control
+    float move_kp;
+    float move_ki;
+    float move_kd;
+    float move_min_pwm;
+    float move_max_pwm;
+    float move_output_smoothing;
+    float move_base_skew;
+    float move_base_pwm;
+    uint32_t move_timeout_ms;
+    
+    // ROTATE tolerances
+    float rotate_tol_distance;
+    float rotate_tol_angle;
+    uint32_t rotate_timeout_ms;
+    
+    // MOVE_DIST tolerances  
+    float move_dist_tol_distance;
+    float move_dist_tol_angle;
+    uint32_t move_dist_timeout_ms;
+    
+    // Angular rate tolerance for "stopped" detection
+    float angular_rate_tol;
+} ConfigParams;
+
+ConfigParams cfg = {
+    // Odometry calibration
+    .odom_distance_scale = 0.902521f,
+    
+    // Closed-loop position control
+    .linear_k = 1.0f,
+    .angular_k = 0.55f,
+    .max_speed = 0.8f,
+    .min_duty_linear = 0.45f,
+    .min_duty_rotate = 0.48f,
+    .min_duty_brake = 0.18f,
+    
+    // MOVE PID control
+    .move_kp = -0.0040f,
+    .move_ki = -0.00015f,
+    .move_kd = -0.0008f,
+    .move_min_pwm = 0.46f,
+    .move_max_pwm = 0.70f,
+    .move_output_smoothing = 0.25f,
+    .move_base_skew = 0.015f,
+    .move_base_pwm = 0.58f,
+    .move_timeout_ms = 20000,
+    
+    // ROTATE tolerances
+    .rotate_tol_distance = 0.02f,
+    .rotate_tol_angle = 0.02f,
+    .rotate_timeout_ms = 10000,
+    
+    // MOVE_DIST tolerances
+    .move_dist_tol_distance = 0.01f,
+    .move_dist_tol_angle = 0.05f,
+    .move_dist_timeout_ms = 10000,
+    
+    // Angular rate tolerance
+    .angular_rate_tol = 0.05f,
+};
 //THEANH END
 /* USER CODE END PV */
 
@@ -275,10 +350,13 @@ void Calculate_Odometry(float dt)
 {
     if (dt <= 0) return;  // Avoid division by zero
 
+    // Calculate meters per count using configurable scale
+    float meters_per_count = (WHEEL_CIRCUMFERENCE_M / COUNTS_PER_WHEEL_REV) * cfg.odom_distance_scale;
+    
     // Calculate wheel velocities (m/s)
-    float v1 = (motor1.delta_count * METERS_PER_COUNT) / dt;
-    float v2 = (motor2.delta_count * METERS_PER_COUNT) / dt;
-    float v3 = (motor3.delta_count * METERS_PER_COUNT) / dt;
+    float v1 = (motor1.delta_count * meters_per_count) / dt;
+    float v2 = (motor2.delta_count * meters_per_count) / dt;
+    float v3 = (motor3.delta_count * meters_per_count) / dt;
 
     motor1.velocity = v1;
     motor2.velocity = v2;
@@ -444,7 +522,7 @@ uint8_t IsAtTarget(void) {
     
     return (distance_error < closed_loop_target.tolerance_distance && 
             angle_error < closed_loop_target.tolerance_angle &&
-            angular_rate < ANGULAR_RATE_TOL);
+            angular_rate < cfg.angular_rate_tol);
 }
 
 void UpdateClosedLoopControl(void) {
@@ -482,22 +560,15 @@ void UpdateClosedLoopControl(void) {
     float dx_robot = dx * cos_theta + dy * sin_theta;
     float dy_robot = -dx * sin_theta + dy * cos_theta;
 
-    // Gain settings
-    const float linear_k = 1.0f;
-    const float angular_k = 0.55f;
-    const float max_speed = 0.8f;
-    const float min_duty_linear = 0.45f; // From user's manual test
-    const float min_duty_rotate = 0.48f; // Slightly above friction threshold
-    const float min_duty_brake = 0.18f;
-
-    float vx = linear_k * dx_robot;
-    float vy = linear_k * dy_robot;
-    float omega = angular_k * dtheta;
+    // Gain settings (from configurable params)
+    float vx = cfg.linear_k * dx_robot;
+    float vy = cfg.linear_k * dy_robot;
+    float omega = cfg.angular_k * dtheta;
 
     // Clamp commands
-    vx = fmaxf(fminf(vx, max_speed), -max_speed);
-    vy = fmaxf(fminf(vy, max_speed), -max_speed);
-    omega = fmaxf(fminf(omega, max_speed), -max_speed);
+    vx = fmaxf(fminf(vx, cfg.max_speed), -cfg.max_speed);
+    vy = fmaxf(fminf(vy, cfg.max_speed), -cfg.max_speed);
+    omega = fmaxf(fminf(omega, cfg.max_speed), -cfg.max_speed);
 
     if (!closed_loop_target.debug_logged_start) {
         sprintf(uart_buffer,
@@ -524,16 +595,16 @@ void UpdateClosedLoopControl(void) {
     }
 
     // Apply deadband and remap to [min_duty, 1.0]
-    float min_duty = min_duty_linear;
+    float min_duty = cfg.min_duty_linear;
     if (distance_error < 0.05f) {
         float angle_mag = fabsf(dtheta);
         if (angle_mag >= 0.4f) {
-            min_duty = min_duty_rotate;
+            min_duty = cfg.min_duty_rotate;
         } else {
             float frac = angle_mag / 0.4f;
             if (frac < 0.0f) frac = 0.0f;
             if (frac > 1.0f) frac = 1.0f;
-            min_duty = min_duty_brake + frac * (min_duty_rotate - min_duty_brake);
+            min_duty = cfg.min_duty_brake + frac * (cfg.min_duty_rotate - cfg.min_duty_brake);
         }
     }
     for (int i = 0; i < 3; i++) {
@@ -610,7 +681,7 @@ void UpdateMoveControl(void) {
 
     uint32_t now = HAL_GetTick();
 
-    // Check timeout
+    // Check timeout (using per-move timeout stored when MOVE was initiated)
     if ((now - move_target.start_time) > move_target.timeout_ms) {
         move_target.active = 0;
         MotorControl_SetAll(MOTOR_DIRECTION_STOP, MOTOR_DIRECTION_STOP, MOTOR_DIRECTION_STOP);
@@ -629,49 +700,41 @@ void UpdateMoveControl(void) {
         return;
     }
 
-    // PID controller for drift correction
-    const float Kp = -0.0040f;
-    const float Ki = -0.00015f;
-    const float Kd = -0.0008f;
-    const float MIN_PWM = 0.46f;
-    const float MAX_PWM = 0.70f;
-    const float OUTPUT_SMOOTHING = 0.25f;
-    const float BASE_DRIVE_SKEW = 0.015f; // Bias to counter left drift
-
+    // PID controller for drift correction (using configurable params)
     int32_t error = motor1.delta_count + motor2.delta_count + motor3.delta_count;
 
     // Proportional term
-    float p_term = Kp * (float)error;
+    float p_term = cfg.move_kp * (float)error;
 
     // Integral term
     move_target.pid_integral += (float)error;
-    float i_term = Ki * move_target.pid_integral;
+    float i_term = cfg.move_ki * move_target.pid_integral;
 
     // Derivative term
     float derivative = (float)error - move_target.pid_previous_error;
-    float d_term = Kd * derivative;
+    float d_term = cfg.move_kd * derivative;
     move_target.pid_previous_error = (float)error;
 
     float correction_pwm = p_term + i_term + d_term;
     // Low-pass filter the PID output so the correction wheel ramps instead of slamming
     correction_pwm = move_target.pid_filtered_output +
-                     OUTPUT_SMOOTHING * (correction_pwm - move_target.pid_filtered_output);
+                     cfg.move_output_smoothing * (correction_pwm - move_target.pid_filtered_output);
     move_target.pid_filtered_output = correction_pwm;
 
     // Apply deadband compensation
     if (fabsf(correction_pwm) > 0.01f) { // Only apply correction if error is significant
         if (correction_pwm > 1.0f) correction_pwm = 1.0f;
         if (correction_pwm < -1.0f) correction_pwm = -1.0f;
-        float output_pwm = MIN_PWM + fabsf(correction_pwm) * (MAX_PWM - MIN_PWM);
-        if (output_pwm > MAX_PWM) {
-            output_pwm = MAX_PWM;
+        float output_pwm = cfg.move_min_pwm + fabsf(correction_pwm) * (cfg.move_max_pwm - cfg.move_min_pwm);
+        if (output_pwm > cfg.move_max_pwm) {
+            output_pwm = cfg.move_max_pwm;
         }
         correction_pwm = copysignf(output_pwm, correction_pwm);
     }
 
     // Apply base PWM to Motor 1 (Reverse) and Motor 3 (Forward) with slight skew for lateral bias
-    float motor1_cmd = -(move_target.base_pwm + BASE_DRIVE_SKEW); // Motor 1 Reverse harder
-    float motor3_cmd =  (move_target.base_pwm - BASE_DRIVE_SKEW); // Motor 3 Forward slightly softer
+    float motor1_cmd = -(move_target.base_pwm + cfg.move_base_skew); // Motor 1 Reverse harder
+    float motor3_cmd =  (move_target.base_pwm - cfg.move_base_skew); // Motor 3 Forward slightly softer
 
     if (motor1_cmd < -1.0f) motor1_cmd = -1.0f;
     if (motor3_cmd > 1.0f)  motor3_cmd = 1.0f;
@@ -907,6 +970,108 @@ void Process_Command(const char *command)
         return;
     }
 
+    //THEANH - SET_PARAM command for runtime configuration
+    if (strcmp(token, "SET_PARAM") == 0) {
+        char *param_name = strtok(NULL, " ,");
+        char *param_value = strtok(NULL, " ,");
+        if (param_name == NULL || param_value == NULL) {
+            Send_Response("ERR SET_PARAM params\r\n");
+            return;
+        }
+        float fval = atof(param_value);
+        uint32_t uval = (uint32_t)atol(param_value);
+        uint8_t found = 1;
+        
+        // Odometry calibration
+        if (strcmp(param_name, "odom_scale") == 0) {
+            cfg.odom_distance_scale = fval;
+        }
+        // Closed-loop position control
+        else if (strcmp(param_name, "linear_k") == 0) {
+            cfg.linear_k = fval;
+        }
+        else if (strcmp(param_name, "angular_k") == 0) {
+            cfg.angular_k = fval;
+        }
+        else if (strcmp(param_name, "max_speed") == 0) {
+            cfg.max_speed = fval;
+        }
+        else if (strcmp(param_name, "min_duty_linear") == 0) {
+            cfg.min_duty_linear = fval;
+        }
+        else if (strcmp(param_name, "min_duty_rotate") == 0) {
+            cfg.min_duty_rotate = fval;
+        }
+        else if (strcmp(param_name, "min_duty_brake") == 0) {
+            cfg.min_duty_brake = fval;
+        }
+        // MOVE PID control
+        else if (strcmp(param_name, "move_kp") == 0) {
+            cfg.move_kp = fval;
+        }
+        else if (strcmp(param_name, "move_ki") == 0) {
+            cfg.move_ki = fval;
+        }
+        else if (strcmp(param_name, "move_kd") == 0) {
+            cfg.move_kd = fval;
+        }
+        else if (strcmp(param_name, "move_min_pwm") == 0) {
+            cfg.move_min_pwm = fval;
+        }
+        else if (strcmp(param_name, "move_max_pwm") == 0) {
+            cfg.move_max_pwm = fval;
+        }
+        else if (strcmp(param_name, "move_smoothing") == 0) {
+            cfg.move_output_smoothing = fval;
+        }
+        else if (strcmp(param_name, "move_skew") == 0) {
+            cfg.move_base_skew = fval;
+        }
+        else if (strcmp(param_name, "move_base_pwm") == 0) {
+            cfg.move_base_pwm = fval;
+        }
+        else if (strcmp(param_name, "move_timeout") == 0) {
+            cfg.move_timeout_ms = uval;
+        }
+        // ROTATE tolerances
+        else if (strcmp(param_name, "rotate_tol_dist") == 0) {
+            cfg.rotate_tol_distance = fval;
+        }
+        else if (strcmp(param_name, "rotate_tol_angle") == 0) {
+            cfg.rotate_tol_angle = fval;
+        }
+        else if (strcmp(param_name, "rotate_timeout") == 0) {
+            cfg.rotate_timeout_ms = uval;
+        }
+        // MOVE_DIST tolerances
+        else if (strcmp(param_name, "move_dist_tol_dist") == 0) {
+            cfg.move_dist_tol_distance = fval;
+        }
+        else if (strcmp(param_name, "move_dist_tol_angle") == 0) {
+            cfg.move_dist_tol_angle = fval;
+        }
+        else if (strcmp(param_name, "move_dist_timeout") == 0) {
+            cfg.move_dist_timeout_ms = uval;
+        }
+        // Angular rate tolerance
+        else if (strcmp(param_name, "angular_rate_tol") == 0) {
+            cfg.angular_rate_tol = fval;
+        }
+        else {
+            found = 0;
+        }
+        
+        if (found) {
+            sprintf(uart_buffer, "OK SET_PARAM %s\r\n", param_name);
+            Send_Response(uart_buffer);
+        } else {
+            sprintf(uart_buffer, "ERR SET_PARAM unknown: %s\r\n", param_name);
+            Send_Response(uart_buffer);
+        }
+        return;
+    }
+    //THEANH END
+
     if (strcmp(token, "MOVE") == 0) {
 		char *distance_token = strtok(NULL, " ,");
 		if (distance_token == NULL) {
@@ -923,8 +1088,8 @@ void Process_Command(const char *command)
 		move_target.target_distance = distance;
 		move_target.start_x = robot.x;
 		move_target.start_y = robot.y;
-		move_target.base_pwm = 0.58f; // Slightly higher to hit full meter
-		move_target.timeout_ms = 20000; // 20s timeout
+		move_target.base_pwm = cfg.move_base_pwm;
+		move_target.timeout_ms = cfg.move_timeout_ms;
 		move_target.start_time = HAL_GetTick();
 		move_target.pid_integral = 0.0f;
 		move_target.pid_previous_error = 0.0f;
@@ -952,14 +1117,12 @@ void Process_Command(const char *command)
         closed_loop_target.target_x = robot.x + distance * cos_theta;
         closed_loop_target.target_y = robot.y + distance * sin_theta;
         closed_loop_target.target_theta = robot.theta;
-        closed_loop_target.tolerance_distance = 0.01; // 1cm tolerance
-        closed_loop_target.tolerance_angle = 0.05;    // ~3 degree tolerance
-        closed_loop_target.timeout_ms = 10000;        // 10 second timeout
+        closed_loop_target.tolerance_distance = cfg.move_dist_tol_distance;
+        closed_loop_target.tolerance_angle = cfg.move_dist_tol_angle;
+        closed_loop_target.timeout_ms = cfg.move_dist_timeout_ms;
         closed_loop_target.start_time = HAL_GetTick();
         closed_loop_target.debug_logged_start = 0;
         closed_loop_target.last_debug_time = HAL_GetTick();
-Send_Response("Version 18 MOVE_DIST armed\r\n");
-        HAL_UART_Transmit(&huart3, (uint8_t*)uart_buffer, strlen(uart_buffer), 100);
         
         Send_Response("OK MOVE_DIST\r\n");
         return;
@@ -1018,9 +1181,9 @@ Send_Response("Version 18 MOVE_DIST armed\r\n");
         while (closed_loop_target.target_theta < -M_PI) 
             closed_loop_target.target_theta += 2.0f * M_PI;
             
-        closed_loop_target.tolerance_distance = 0.02; // 2cm tolerance (allow some drift)
-        closed_loop_target.tolerance_angle = 0.02;    // ~1 degree tolerance
-        closed_loop_target.timeout_ms = 10000;
+        closed_loop_target.tolerance_distance = cfg.rotate_tol_distance;
+        closed_loop_target.tolerance_angle = cfg.rotate_tol_angle;
+        closed_loop_target.timeout_ms = cfg.rotate_timeout_ms;
         closed_loop_target.start_time = HAL_GetTick();
         closed_loop_target.debug_logged_start = 0;
         closed_loop_target.last_debug_time = HAL_GetTick();
