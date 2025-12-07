@@ -157,6 +157,7 @@ float body_from_wheel_mat[3][3]; // Maps wheel speeds back to chassis twist
 typedef struct {
     // Odometry calibration
     float odom_distance_scale;
+    float odom_angular_scale;  // Separate scale for rotation (compensates for wheel slip during rotation)
     
     // Closed-loop position control
     float linear_k;
@@ -194,6 +195,7 @@ typedef struct {
 ConfigParams cfg = {
     // Odometry calibration
     .odom_distance_scale = 0.902521f,
+    .odom_angular_scale = 1.0f,  // Default 1.0 (no additional angular correction)
     
     // Closed-loop position control
     .linear_k = 1.0f,
@@ -368,7 +370,7 @@ void Calculate_Odometry(float dt)
 
     robot.vx = body_vector[0];
     robot.vy = body_vector[1];
-    robot.omega = body_vector[2];
+    robot.omega = body_vector[2] * cfg.odom_angular_scale;  // Apply angular scale for rotation calibration
 
     robot.theta += robot.omega * dt;
 
@@ -985,6 +987,9 @@ void Process_Command(const char *command)
         // Odometry calibration
         if (strcmp(param_name, "odom_scale") == 0) {
             cfg.odom_distance_scale = fval;
+        }
+        else if (strcmp(param_name, "odom_angular_scale") == 0) {
+            cfg.odom_angular_scale = fval;
         }
         // Closed-loop position control
         else if (strcmp(param_name, "linear_k") == 0) {
